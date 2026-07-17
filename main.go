@@ -7,21 +7,30 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/c-bata/go-prompt"
+
 	"gowhale/internal/agent"
 	"gowhale/internal/config"
 	"gowhale/internal/llm"
 	"gowhale/internal/tools"
 )
 
+// slashCommands 所有 / 命令及其描述（用于下拉和建议）
+var slashCommands = []prompt.Suggest{
+	{Text: "/help", Description: "帮助信息"},
+	{Text: "/model", Description: "查看当前模型"},
+	{Text: "/clear", Description: "清空对话历史"},
+	{Text: "/clear-key", Description: "清除已保存的 API Key"},
+	{Text: "/exit", Description: "退出程序"},
+}
+
 func main() {
-	// --clear-key 命令行参数
 	if len(os.Args) == 2 && (os.Args[1] == "--clear-key" || os.Args[1] == "-clear-key") {
 		clearAPIKey(bufio.NewReader(os.Stdin))
 		return
 	}
 
 	cfg := config.Load()
-
 	client := llm.NewClient(cfg)
 	registry := tools.New(
 		tools.WritePlanTool{},
@@ -42,98 +51,96 @@ func main() {
 	tools.SetWorkspace(workspace)
 	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
 
-	// 模式一：命令行直接带任务
 	if len(os.Args) > 1 {
 		ag.Run(strings.Join(os.Args[1:], " "))
 		return
 	}
 
-	// 模式二：交互式多轮
 	printBanner(cfg)
 
-	for {
-		fmt.Print("\n你 > ")
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println()
-			return
-		}
-		input := strings.TrimSpace(line)
-		if input == "" {
-			continue
-		}
-
-		// / 开头的命令
-		if strings.HasPrefix(input, "/") {
-			if handleCommand(input, reader) {
-				return // exit
+	// 用 go-prompt 替代 bufio.Reader，支持 / 命令下拉 + 模糊搜索 + 上下选择 + 历史记录
+	p := prompt.New(
+		func(input string) {
+			input = strings.TrimSpace(input)
+			if input == "" {
+				return
 			}
-			continue
-		}
 
-		// 纯文本退出
-		if input == "exit" || input == "quit" {
-			fmt.Println("再见！")
-			return
-		}
+			if strings.HasPrefix(input, "/") {
+				exit := handleCommand(input, reader)
+				if exit {
+					fmt.Println("再见！")
+					os.Exit(0)
+				}
+				return
+			}
 
-		ag.Run(input)
-	}
+			if input == "exit" || input == "quit" {
+				fmt.Println("再见！")
+				os.Exit(0)
+			}
+
+			ag.Run(input)
+		},
+		completer,
+		prompt.OptionPrefix("你 > "),
+		prompt.OptionHistory([]string{}),
+		prompt.OptionPrefixTextColor(prompt.Cyan),
+		prompt.OptionPreviewSuggestionTextColor(prompt.Blue),
+		prompt.OptionSelectedSuggestionBGColor(prompt.DarkGray),
+		prompt.OptionSuggestionBGColor(prompt.Black),
+	)
+	p.Run()
 }
 
-// printBanner 启动提示，参考 CodeWhale 的 HomeQuick 格式。
+// completer 根据输入返回建议——空输入显示全部命令，/ 开头过滤。
+func completer(d prompt.Document) []prompt.Suggest {
+	text := d.TextBeforeCursor()
+	if text == "" {
+		return nil // 空输入不弹出
+	}
+	if strings.HasPrefix(text, "/") {
+		return prompt.FilterHasPrefix(slashCommands, text, true)
+	}
+	return nil
+}
+
 func printBanner(cfg config.Config) {
 	fmt.Printf("GoWhale — AI 编程助手（%s / %s）\n", cfg.Model, cfg.ProModel)
 	fmt.Println(strings.Repeat("─", 48))
-	fmt.Println("输入任务，回车执行。以下 / 命令可用：")
+	fmt.Println("输入任务开始。输入 / 查看命令（支持模糊搜索 + 方向键选择）。")
 	fmt.Println()
-	fmt.Println("  /help        帮助信息（显示本条）")
-	fmt.Println("  /model       查看/切换当前模型")
-	fmt.Println("  /clear       清空对话历史，开始新会话")
-	fmt.Println("  /clear-key   清除已保存的 API Key")
-	fmt.Println("  /exit        退出程序")
-	fmt.Println()
-	fmt.Println("直接输入自然语言即可开始任务。")
 }
 
-// handleCommand 处理 / 开头的交互命令。返回 true 表示退出。
 func handleCommand(input string, in *bufio.Reader) bool {
-	switch strings.ToLower(input) {
+	cmd := strings.ToLower(strings.TrimSpace(input))
+	switch cmd {
 	case "/help":
-		fmt.Println()
-		fmt.Println("GoWhale 命令列表：")
-		fmt.Println("  /help        显示本帮助")
-		fmt.Println("  /model       显示当前模型（简单 / 复杂）")
-		fmt.Println("  /clear       清空全部对话历史")
-		fmt.Println("  /clear-key   清除 ~/.gowhale/.env 中的 API Key")
-		fmt.Println("  /exit        退出")
-		fmt.Println()
-		fmt.Println("提示：直接输入任务描述即可开始，无需前缀。")
-		fmt.Println("复杂任务（写代码/多步推理）自动路由到 pro 模型。")
+		fmt.Println("\n命令列表（/ 下拉也可查看）：")
+		for _, s := range slashCommands {
+			fmt.Printf("  %-14s %s\n", s.Text, s.Description)
+		}
+		fmt.Println("\n直接输入自然语言开始任务。复杂任务自动路由到 pro 模型。")
 
 	case "/model":
-		fmt.Printf("简单任务: %s\n复杂任务: %s\n", config.Load().Model, config.Load().ProModel)
+		cfg := config.Load()
+		fmt.Printf("\n简单任务: %s\n复杂任务: %s\n\n", cfg.Model, cfg.ProModel)
 
 	case "/clear":
-		fmt.Println("✓ 对话历史已清空。输入新任务开始。")
-		// Note: 需要重启 agent 才能真正清空历史。这里先给个提示，
-		// 实际清空需要重构 agent 支持 reset。
-		fmt.Println("  提示：输入 /exit 退出后重新进，即可完全重置。")
+		fmt.Println("✓ 对话历史已清空。输入 /exit 退出后重新进即可完全重置。")
 
 	case "/clear-key":
 		clearAPIKey(in)
 
 	case "/exit", "/quit":
-		fmt.Println("再见！")
 		return true
 
 	default:
-		fmt.Printf("未知命令: %s。输入 /help 查看可用命令。\n", input)
+		fmt.Printf("未知命令: %s\n", cmd)
 	}
 	return false
 }
 
-// clearAPIKey 清除 ~/.gowhale/.env 中保存的 API Key。使用共享 reader 避免缓冲冲突。
 func clearAPIKey(in *bufio.Reader) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
