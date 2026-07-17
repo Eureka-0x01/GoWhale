@@ -1,0 +1,8 @@
+# 编译产物
+gowhale.exe
+
+# 工作区运行时数据（每个项目目录下自动生成）
+.aicode/
+
+# Go
+go.sum
