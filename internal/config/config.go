@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config 保存调用大模型所需的配置。
@@ -16,12 +17,12 @@ type Config struct {
 	MaxTurns int    // 单次请求内最大工具调用轮数
 }
 
-// Load 从环境变量读取配置，并提供合理的默认值（默认走 DeepSeek）。
-// 注意：默认 APIKey 为方便本地测试而硬编码，请勿把它提交到公共仓库。
+// Load 先读 .env 文件，再读环境变量（环境变量优先）。
 func Load() Config {
+	loadDotEnv()
 	return Config{
 		BaseURL:  getenv("AICODE_BASE_URL", "https://api.deepseek.com/v1"),
-		APIKey:   getenv("AICODE_API_KEY", "sk-e4e33b6d22c84b8ab316510758c0a259"),
+		APIKey:   getenv("AICODE_API_KEY", ""),
 		Model:    getenv("AICODE_MODEL", "deepseek-v4-flash"),
 		ProModel: getenv("AICODE_PRO_MODEL", "deepseek-v4-pro"),
 		MaxTurns: getenvInt("AICODE_MAX_TURNS", 40),
@@ -42,4 +43,29 @@ func getenvInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+// loadDotEnv 读取当前目录的 .env 文件，把 KEY=VALUE 行设为环境变量（已有则跳过）。
+func loadDotEnv() {
+	data, err := os.ReadFile(".env")
+	if err != nil {
+		return // 没有 .env 文件就算了
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		kv := strings.SplitN(line, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		val := strings.TrimSpace(kv[1])
+		// 去掉引号
+		val = strings.Trim(val, "\"'")
+		if key != "" && os.Getenv(key) == "" {
+			os.Setenv(key, val)
+		}
+	}
 }

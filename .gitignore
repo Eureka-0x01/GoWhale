@@ -4,4 +4,7 @@ gowhale.exe
 # 工作区运行时数据（每个项目目录下自动生成）
 .aicode/
 
+# 配置文件（含 API Key，不可提交）
+.env
+
 # Go
