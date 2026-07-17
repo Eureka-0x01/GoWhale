@@ -1,32 +1,46 @@
 package config
 
 import (
+	"bufio"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
 
-// Config 保存调用大模型所需的配置。
-// 借鉴 CodeWhale 的思路：provider / model / baseURL / 凭据是分开的选择，
-// 都可以通过环境变量单独覆盖。
+// Config 保存调用大模型所需的配置。加载优先级: 环境变量 > 当前目录 .env > ~/.gowhale/.env
 type Config struct {
-	BaseURL  string // 大模型 API 地址（OpenAI 兼容）
-	APIKey   string // 访问密钥
-	Model    string // 日常模型（简单对话/只读操作）
-	ProModel string // 复杂任务模型（多步推理/代码生成/调试）
-	MaxTurns int    // 单次请求内最大工具调用轮数
+	BaseURL  string
+	APIKey   string
+	Model    string
+	ProModel string
+	MaxTurns int
 }
 
-// Load 先读 .env 文件，再读环境变量（环境变量优先）。
+// Load 按优先级加载配置。Key 缺失时交互式提示用户输入并保存到 ~/.gowhale/.env。
 func Load() Config {
-	loadDotEnv()
-	return Config{
+	homeDir, _ := os.UserHomeDir()
+	globalEnv := filepath.Join(homeDir, ".gowhale", ".env")
+
+	// 优先级从低到高加载（后面覆盖前面）
+	loadDotEnv(globalEnv) // ① 全局默认
+	loadDotEnv(".env")    // ② 当前目录
+
+	cfg := Config{
 		BaseURL:  getenv("AICODE_BASE_URL", "https://api.deepseek.com/v1"),
-		APIKey:   getenv("AICODE_API_KEY", ""),
+		APIKey:   getenv("AICODE_API_KEY", ""), // ③ 环境变量最高
 		Model:    getenv("AICODE_MODEL", "deepseek-v4-flash"),
 		ProModel: getenv("AICODE_PRO_MODEL", "deepseek-v4-pro"),
 		MaxTurns: getenvInt("AICODE_MAX_TURNS", 40),
 	}
+
+	// Key 还是空的 → 交互式让用户输入
+	if cfg.APIKey == "" {
+		cfg.APIKey = promptKey(globalEnv)
+	}
+
+	return cfg
 }
 
 func getenv(key, def string) string {
@@ -45,11 +59,10 @@ func getenvInt(key string, def int) int {
 	return def
 }
 
-// loadDotEnv 读取当前目录的 .env 文件，把 KEY=VALUE 行设为环境变量（已有则跳过）。
-func loadDotEnv() {
-	data, err := os.ReadFile(".env")
+func loadDotEnv(path string) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return // 没有 .env 文件就算了
+		return
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -62,10 +75,39 @@ func loadDotEnv() {
 		}
 		key := strings.TrimSpace(kv[0])
 		val := strings.TrimSpace(kv[1])
-		// 去掉引号
 		val = strings.Trim(val, "\"'")
 		if key != "" && os.Getenv(key) == "" {
 			os.Setenv(key, val)
 		}
 	}
+}
+
+// promptKey 没有 Key 时交互式询问，保存到 ~/.gowhale/.env。
+func promptKey(savePath string) string {
+	fmt.Fprintln(os.Stderr, "未检测到 API Key。")
+	fmt.Fprint(os.Stderr, "请输入 DeepSeek API Key（如 sk-xxx）：")
+
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "读取失败，请设置环境变量 AICODE_API_KEY 后重试。")
+		os.Exit(1)
+	}
+	key := strings.TrimSpace(input)
+	if key == "" {
+		fmt.Fprintln(os.Stderr, "Key 不能为空，请设置环境变量 AICODE_API_KEY 后重试。")
+		os.Exit(1)
+	}
+
+	// 保存到 ~/.gowhale/.env
+	dir := filepath.Dir(savePath)
+	if err := os.MkdirAll(dir, 0o700); err == nil {
+		content := fmt.Sprintf("# GoWhale 配置文件\nAICODE_API_KEY=%s\n", key)
+		if err := os.WriteFile(savePath, []byte(content), 0o600); err == nil {
+			fmt.Fprintf(os.Stderr, "✓ 已保存到 %s，下次无需重复输入。\n", savePath)
+		}
+	}
+
+	os.Setenv("AICODE_API_KEY", key)
+	return key
 }
