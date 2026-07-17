@@ -80,6 +80,7 @@ func main() {
 				os.Exit(0)
 			}
 
+			fmt.Println() // 输入提交后换行
 			ag.Run(input)
 		},
 		completer,
@@ -89,6 +90,8 @@ func main() {
 		prompt.OptionPreviewSuggestionTextColor(prompt.Blue),
 		prompt.OptionSelectedSuggestionBGColor(prompt.DarkGray),
 		prompt.OptionSuggestionBGColor(prompt.Black),
+		prompt.OptionLivePrefix(func() (string, bool) { return "你 > ", true }),
+		prompt.OptionCompletionWordSeparator(" "),
 	)
 	p.Run()
 }
