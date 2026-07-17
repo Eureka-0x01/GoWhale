@@ -22,8 +22,8 @@ func Load() Config {
 	return Config{
 		BaseURL:  getenv("AICODE_BASE_URL", "https://api.deepseek.com/v1"),
 		APIKey:   getenv("AICODE_API_KEY", "sk-e4e33b6d22c84b8ab316510758c0a259"),
-		Model:    getenv("AICODE_MODEL", "deepseek-chat"),
-		ProModel: getenv("AICODE_PRO_MODEL", "deepseek-reasoner"),
+		Model:    getenv("AICODE_MODEL", "deepseek-v4-flash"),
+		ProModel: getenv("AICODE_PRO_MODEL", "deepseek-v4-pro"),
 		MaxTurns: getenvInt("AICODE_MAX_TURNS", 40),
 	}
 }
