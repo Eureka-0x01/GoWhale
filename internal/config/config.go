@@ -11,7 +11,8 @@ import (
 type Config struct {
 	BaseURL  string // 大模型 API 地址（OpenAI 兼容）
 	APIKey   string // 访问密钥
-	Model    string // 使用的模型
+	Model    string // 日常模型（简单对话/只读操作）
+	ProModel string // 复杂任务模型（多步推理/代码生成/调试）
 	MaxTurns int    // 单次请求内最大工具调用轮数
 }
 
@@ -22,6 +23,7 @@ func Load() Config {
 		BaseURL:  getenv("AICODE_BASE_URL", "https://api.deepseek.com/v1"),
 		APIKey:   getenv("AICODE_API_KEY", "sk-e4e33b6d22c84b8ab316510758c0a259"),
 		Model:    getenv("AICODE_MODEL", "deepseek-chat"),
+		ProModel: getenv("AICODE_PRO_MODEL", "deepseek-reasoner"),
 		MaxTurns: getenvInt("AICODE_MAX_TURNS", 40),
 	}
 }

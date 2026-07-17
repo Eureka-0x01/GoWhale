@@ -20,6 +20,8 @@ type Agent struct {
 	spinner    Spinner
 	history    []llm.Message
 	recentCmds map[string]int
+	fastModel  string // 快速模型（简单问题）
+	proModel   string // 复杂模型（多步推理/代码生成）
 }
 
 const skillRules = "" +
@@ -52,7 +54,7 @@ const skillRules = "" +
 	"- 完成后用简洁的中文总结。"
 
 // New 创建 Agent。maxTurns 为单次请求内的最大工具调用轮数。
-func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTurns int, workspace string) *Agent {
+func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTurns int, workspace string, fastModel, proModel string) *Agent {
 	if err := os.MkdirAll(workspace, 0o755); err == nil {
 		ensureDefaultConstitution(workspace)
 	}
@@ -77,12 +79,22 @@ func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTu
 		maxTurns:   maxTurns,
 		recentCmds: map[string]int{},
 		history:    history,
+		fastModel:  fastModel,
+		proModel:   proModel,
 	}
 }
 
 // Run 处理一条用户输入，期间可能多次调用工具，最后打印模型的回答。
 func (a *Agent) Run(input string) {
-	a.journal.Task(input)
+	// 复杂度分类：用 fast 模型判断是否需要切到 pro
+	complex := a.classify(input)
+	if complex {
+		a.client.SetModel(a.proModel)
+	} else {
+		a.client.SetModel(a.fastModel)
+	}
+
+	a.journal.Task(input + fmt.Sprintf(" [模型: %s]", a.client.Model()))
 	a.history = append(a.history, llm.Message{Role: "user", Content: input})
 	defs := a.registry.Definitions()
 	step := 0
@@ -260,6 +272,33 @@ func indentLines(s string, spaces int) string {
 		lines[i] = prefix + l
 	}
 	return strings.Join(lines, "\n")
+}
+
+// classify 用 fast 模型判断用户请求是否复杂任务。
+// 只有复杂任务（多步推理/代码生成/调试）才值得切到 pro 模型。
+func (a *Agent) classify(input string) bool {
+	// 保存当前模型，分类完恢复
+	origModel := a.client.Model()
+	a.client.SetModel(a.fastModel)
+
+	classifyPrompt := "判断以下用户请求属于 '简单' 还是 '复杂'。" +
+		"简单: 问候、闲聊、单一事实查询、读文件、只涉及 list_dir/read_file、不需要多步推理。" +
+		"复杂: 写代码、生成文件、修改多文件、调试错误、多步任务、需要推理规划、编译运行验证。" +
+		"\n\n用户请求: " + input + "\n\n只回答一个字: 简单 或 复杂"
+
+	msg, err := a.client.Chat([]llm.Message{{Role: "user", Content: classifyPrompt}}, nil)
+	if err != nil {
+		a.client.SetModel(origModel)
+		return false // 分类失败，保守用 fast
+	}
+
+	result := strings.ToLower(strings.TrimSpace(msg.Content))
+	isComplex := strings.Contains(result, "复杂")
+
+	fmt.Printf("%s\n", dim(fmt.Sprintf("复杂度: %s → %s", result,
+		map[bool]string{true: bold(blue("使用 " + a.proModel)), false: gray("使用 " + a.fastModel)}[isComplex])))
+	a.client.SetModel(origModel) // 恢复，Run() 里会根据结果再设
+	return isComplex
 }
 
 func (a *Agent) hitLimit() {

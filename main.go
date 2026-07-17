@@ -41,7 +41,7 @@ func main() {
 
 	workspace, _ := os.Getwd()
 	tools.SetWorkspace(workspace) // 锁定工作区，文件/shell 无法越界
-	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace)
+	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
 
 	// 模式一：命令行直接带任务，执行完退出。
 	if len(os.Args) > 1 {

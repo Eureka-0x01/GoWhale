@@ -56,8 +56,11 @@ func NewClient(cfg config.Config) *Client {
 	return &Client{cfg: cfg, http: &http.Client{Timeout: 5 * time.Minute}}
 }
 
-// Model 返回当前使用的模型名，方便打印。
+// Model 返回当前使用的模型名。
 func (c *Client) Model() string { return c.cfg.Model }
+
+// SetModel 动态切换模型（用于复杂度路由）。
+func (c *Client) SetModel(m string) { c.cfg.Model = m }
 
 type chatRequest struct {
 	Model    string    `json:"model"`
