@@ -81,13 +81,11 @@ Agent 会在**当前工作目录**下的 `.aicode/journal.md` 记录自己的工
 ## 使用
 
 ```bash
-cd /d/ronghuicode/other/aiCode
-
 # 一次性任务
-go run . "在 demo 目录下生成一个 Go 版 hello world 并编译运行"
+gowhale "在 demo 目录下生成一个 Go 版 hello world 并编译运行"
 
 # 交互式多轮（exit 退出）
-go run .
+gowhale
 ```
 
 ## 目录结构
