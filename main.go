@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gowhale/internal/agent"
@@ -13,6 +14,12 @@ import (
 )
 
 func main() {
+	// --clear-key：清除已保存的 API Key
+	if len(os.Args) == 2 && (os.Args[1] == "--clear-key" || os.Args[1] == "-clear-key") {
+		clearAPIKey()
+		return
+	}
+
 	cfg := config.Load()
 	if cfg.APIKey == "" {
 		fmt.Fprintln(os.Stderr, "错误：未设置 API Key。请设置环境变量 AICODE_API_KEY 后重试。")
@@ -71,4 +78,32 @@ func main() {
 		}
 		ag.Run(input)
 	}
+}
+
+// clearAPIKey 清除 ~/.gowhale/.env 中保存的 API Key，清除前需用户确认。
+func clearAPIKey() {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误：无法获取用户目录")
+		os.Exit(1)
+	}
+	path := filepath.Join(homeDir, ".gowhale", ".env")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		fmt.Println("没有已保存的 API Key（~/.gowhale/.env 不存在）。")
+		return
+	}
+
+	fmt.Print("确认要清除已保存的 API Key 吗？[y/N] ")
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	if strings.ToLower(strings.TrimSpace(line)) != "y" {
+		fmt.Println("已取消。")
+		return
+	}
+
+	if err := os.Remove(path); err != nil {
+		fmt.Fprintf(os.Stderr, "清除失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✓ 已清除 ~/.gowhale/.env。下次运行 gowhale 时会提示输入新 Key。")
 }
