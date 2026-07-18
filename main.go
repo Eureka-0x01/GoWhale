@@ -58,7 +58,7 @@ func main() {
 
 	printBanner(cfg)
 
-	// 用 go-prompt 替代 bufio.Reader，支持 / 命令下拉 + 模糊搜索 + 上下选择 + 历史记录
+	// 用 go-prompt 替代 bufio.Reader，支持 / 命令下拉 + Tab 循环选择 + 历史记录
 	p := prompt.New(
 		func(input string) {
 			input = strings.TrimSpace(input)
@@ -92,15 +92,22 @@ func main() {
 		prompt.OptionSuggestionBGColor(prompt.Black),
 		prompt.OptionLivePrefix(func() (string, bool) { return "你 > ", true }),
 		prompt.OptionCompletionWordSeparator(" "),
+		// Tab 键循环选择 / 命令（解决 Windows 终端方向键不兼容问题）
+		prompt.OptionAddKeyBind(
+			prompt.KeyBind{
+				Key: prompt.Tab,
+				Fn:  tabCycleSlash,
+			},
+		),
 	)
 	p.Run()
 }
 
-// completer 根据输入返回建议——空输入显示全部命令，/ 开头过滤。
+// completer 根据输入返回建议——空输入不弹出，/ 开头过滤。
 func completer(d prompt.Document) []prompt.Suggest {
 	text := d.TextBeforeCursor()
 	if text == "" {
-		return nil // 空输入不弹出
+		return nil
 	}
 	if strings.HasPrefix(text, "/") {
 		return prompt.FilterHasPrefix(slashCommands, text, true)
@@ -108,10 +115,35 @@ func completer(d prompt.Document) []prompt.Suggest {
 	return nil
 }
 
+// tabCycleSlash 当输入以 / 开头时，按 Tab 循环切换命令。
+func tabCycleSlash(buf *prompt.Buffer) {
+	text := buf.Text()
+	if !strings.HasPrefix(text, "/") {
+		return
+	}
+	// 找到当前匹配的命令，切换到下一个
+	for i, cmd := range slashCommands {
+		if text == cmd.Text {
+			next := slashCommands[(i+1)%len(slashCommands)]
+			buf.DeleteBeforeCursor(len(text))
+			buf.InsertText(next.Text, false, true)
+			return
+		}
+	}
+	// 当前文本不匹配任一命令，插入第一个
+	for _, cmd := range slashCommands {
+		if strings.HasPrefix(cmd.Text, text) {
+			buf.DeleteBeforeCursor(len(text))
+			buf.InsertText(cmd.Text, false, true)
+			return
+		}
+	}
+}
+
 func printBanner(cfg config.Config) {
 	fmt.Printf("GoWhale — AI 编程助手（%s / %s）\n", cfg.Model, cfg.ProModel)
 	fmt.Println(strings.Repeat("─", 48))
-	fmt.Println("输入任务开始。输入 / 查看命令（支持模糊搜索 + 方向键选择）。")
+	fmt.Println("输入任务开始。输入 / 查看命令（Tab 循环选择）。")
 	fmt.Println()
 }
 
