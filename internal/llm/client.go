@@ -12,29 +12,24 @@ import (
 	"gowhale/internal/config"
 )
 
-// Message 是一条对话消息。
-// role 为 system / user / assistant / tool。
 type Message struct {
 	Role       string     `json:"role"`
 	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant 发起的工具调用
-	ToolCallID string     `json:"tool_call_id,omitempty"` // tool 角色：对应的调用 ID
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
-// ToolCall 是模型要求执行的一次工具调用。
 type ToolCall struct {
 	ID       string       `json:"id"`
 	Type     string       `json:"type"`
 	Function FunctionCall `json:"function"`
 }
 
-// FunctionCall 里的 Arguments 是一段 JSON 字符串。
 type FunctionCall struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
 }
 
-// Tool 是发给模型的工具定义（OpenAI function calling 格式）。
 type Tool struct {
 	Type     string             `json:"type"`
 	Function ToolFunctionSchema `json:"function"`
@@ -46,14 +41,12 @@ type ToolFunctionSchema struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
-// Usage 记录单次 API 调用的 token 消耗。
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// Client 封装对大模型的调用。
 type Client struct {
 	cfg  config.Config
 	http *http.Client
@@ -63,11 +56,19 @@ func NewClient(cfg config.Config) *Client {
 	return &Client{cfg: cfg, http: &http.Client{Timeout: 5 * time.Minute}}
 }
 
-// Model 返回当前使用的模型名。
-func (c *Client) Model() string { return c.cfg.Model }
+func (c *Client) Model() string    { return c.cfg.Model }
+func (c *Client) BaseURL() string  { return c.cfg.BaseURL }
+func (c *Client) SetModel(m string)  { c.cfg.Model = m }
+func (c *Client) SetBaseURL(u string) { c.cfg.BaseURL = u }
+func (c *Client) SetAPIKey(k string)  { c.cfg.APIKey = k }
 
-// SetModel 动态切换模型（用于复杂度路由）。
-func (c *Client) SetModel(m string) { c.cfg.Model = m }
+// SwitchTo 一键切换提供商
+func (c *Client) SwitchTo(baseURL, apiKey, model, proModel string) {
+	c.cfg.BaseURL = baseURL
+	c.cfg.APIKey = apiKey
+	c.cfg.Model = model
+	c.cfg.ProModel = proModel
+}
 
 type chatRequest struct {
 	Model    string    `json:"model"`
@@ -82,8 +83,6 @@ type chatResponse struct {
 	Usage *Usage `json:"usage,omitempty"`
 }
 
-// Chat 发送一轮对话（非流式）。带上 tools 后模型可能返回 tool_calls。
-// 返回消息和 token 用量信息。
 func (c *Client) Chat(messages []Message, tools []Tool) (Message, Usage, error) {
 	body, err := json.Marshal(chatRequest{
 		Model:    c.cfg.Model,
@@ -131,7 +130,6 @@ func (c *Client) Chat(messages []Message, tools []Tool) (Message, Usage, error) 
 	return parsed.Choices[0].Message, usage, nil
 }
 
-// formatTokens 将 token 数转为可读字符串。
 func FormatTokens(n int) string {
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)

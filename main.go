@@ -22,6 +22,8 @@ var slashCommands = []prompt.Suggest{
 	{Text: "/clear", Description: "清空对话历史"},
 	{Text: "/clear-key", Description: "清除已保存的 API Key"},
 	{Text: "/compact", Description: "压缩上下文节省 token"},
+	{Text: "/ollama", Description: "切换使用 Ollama 本地模型"},
+	{Text: "/deepseek", Description: "切换使用 DeepSeek 云端模型"},
 	{Text: "/exit", Description: "退出程序"},
 }
 
@@ -148,6 +150,25 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 		ag.Compact()
 		after := ag.TokenCount()
 		fmt.Printf("  节省: %s → %s token\n", llm.FormatTokens(before), llm.FormatTokens(after))
+
+	case "/ollama":
+		ag.SwitchProvider(
+			"http://localhost:11434/v1",
+			"ollama",
+			"qwen3-coder:30b",
+			"qwen3-coder:30b",
+		)
+		fmt.Println("✓ 已切换到 Ollama (qwen3-coder:30b)")
+
+	case "/deepseek":
+		cfg2 := config.Load()
+		ag.SwitchProvider(
+			cfg2.BaseURL,
+			cfg2.APIKey,
+			cfg2.Model,
+			cfg2.ProModel,
+		)
+		fmt.Println("✓ 已切换到 DeepSeek")
 
 	case "/exit", "/quit":
 		return true

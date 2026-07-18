@@ -160,6 +160,30 @@ func (a *Agent) Compact() {
 	fmt.Printf("  %s 上下文已压缩，保留最近 %d 条消息\n", greenC("✓"), keep)
 }
 
+// SwitchProvider 切换 LLM 提供商（DeepSeek ↔ Ollama）。
+func (a *Agent) SwitchProvider(baseURL, apiKey, model, proModel string) {
+	a.client.SwitchTo(baseURL, apiKey, model, proModel)
+	a.fastModel = model
+	a.proModel = proModel
+}
+
+// ProviderName 返回当前提供商名。
+func (a *Agent) ProviderName() string {
+	if strings.Contains(a.client.BaseURL(), "ollama") || strings.Contains(a.client.BaseURL(), "11434") {
+		return "ollama"
+	}
+	return "deepseek"
+}
+
+// ProviderInfo 返回当前提供商信息。
+func (a *Agent) ProviderInfo() (name, baseURL, model, proModel string) {
+	name = a.ProviderName()
+	baseURL = a.client.BaseURL()
+	model = a.fastModel
+	proModel = a.proModel
+	return
+}
+
 // TokenCount 返回已使用的总 token 数。
 func (a *Agent) TokenCount() int { return a.totalTokens }
 
