@@ -113,7 +113,7 @@ func (a *Agent) Run(input string) {
 		a.history = append(a.history, msg)
 
 		if len(msg.ToolCalls) == 0 {
-			fmt.Printf("\n%s %s  %s\n", bold(blue("AI >")), msg.Content, tokenBadge(a.totalTokens))
+			fmt.Printf("\n%s %s  %s\n", boldC(blueC("AI >")), msg.Content, tokenBadge(a.totalTokens))
 			a.journal.Note("✅ " + msg.Content)
 			return
 		}
@@ -157,7 +157,7 @@ func (a *Agent) Compact() {
 	}
 	a.totalTokens = 0 // 重置计数器
 	a.recentCmds = map[string]int{}
-	fmt.Printf("  %s 上下文已压缩，保留最近 %d 条消息\n", green("✓"), keep)
+	fmt.Printf("  %s 上下文已压缩，保留最近 %d 条消息\n", greenC("✓"), keep)
 }
 
 // TokenCount 返回已使用的总 token 数。
@@ -200,9 +200,9 @@ func (a *Agent) doWithApproval(tc llm.ToolCall) string {
 
 func formatToolLabel(step int, tc llm.ToolCall) string {
 	icon := toolIcon(tc.Function.Name)
-	name := gray(tc.Function.Name)
-	args := dim(compactArgs(tc.Function.Arguments))
-	return fmt.Sprintf("%s %s %-14s %s", gray(fmt.Sprintf("[%d]", step)), icon, name, args)
+	name := grayC(tc.Function.Name)
+	args := dimC(compactArgs(tc.Function.Arguments))
+	return fmt.Sprintf("%s %s %-14s %s", grayC(fmt.Sprintf("[%d]", step)), icon, name, args)
 }
 
 func toolIcon(name string) string {
@@ -227,7 +227,7 @@ func tokenBadge(n int) string {
 	if n <= 0 {
 		return ""
 	}
-	return dim(fmt.Sprintf("[📊 %s]", llm.FormatTokens(n)))
+	return dimC(fmt.Sprintf("[📊 %s]", llm.FormatTokens(n)))
 }
 
 func compactArgs(raw string) string {
@@ -283,13 +283,13 @@ func statusLine(result string) string {
 	}
 	switch {
 	case strings.Contains(result, "执行出错："):
-		return red("✗") + " " + red(s)
+		return redC("✗") + " " + redC(s)
 	case strings.Contains(result, "用户拒绝"):
-		return yellow("⊘") + " " + yellow("已拒绝")
+		return yellowC("⊘") + " " + yellowC("已拒绝")
 	case strings.HasPrefix(result, "错误"):
-		return red("✗") + " " + red(s)
+		return redC("✗") + " " + redC(s)
 	default:
-		return green("✓") + " " + dim(s)
+		return greenC("✓") + " " + dimC(s)
 	}
 }
 
@@ -333,8 +333,8 @@ func (a *Agent) classify(input string) bool {
 	result := strings.ToLower(strings.TrimSpace(msg.Content))
 	isComplex := strings.Contains(result, "复杂")
 
-	fmt.Printf("%s %s\n", dim(fmt.Sprintf("复杂度: %s → %s", result,
-		map[bool]string{true: bold(blue("使用 " + a.proModel)), false: gray("使用 " + a.fastModel)}[isComplex])),
+	fmt.Printf("%s %s\n", dimC(fmt.Sprintf("复杂度: %s → %s", result,
+		map[bool]string{true: boldC(blueC("使用 " + a.proModel)), false: grayC("使用 " + a.fastModel)}[isComplex])),
 		tokenBadge(a.totalTokens))
 	a.client.SetModel(origModel) // 恢复，Run() 里会根据结果再设
 	return isComplex
@@ -342,7 +342,7 @@ func (a *Agent) classify(input string) bool {
 
 func (a *Agent) hitLimit() {
 	a.journal.Note(fmt.Sprintf("⚠️ 达到工具调用上限（%d 轮），任务可能尚未完成", a.maxTurns))
-	fmt.Printf("\n%s 已连续调用工具 %d 轮仍未结束，任务可能较大。\n", yellow("⚠️"), a.maxTurns)
+	fmt.Printf("\n%s 已连续调用工具 %d 轮仍未结束，任务可能较大。\n", yellowC("⚠️"), a.maxTurns)
 	fmt.Println("   进度已记录到 .aicode/journal.md。你可以：")
 	fmt.Println("   1. 直接输入「继续」——上下文已保留，我会接着未完成的部分做；")
 	fmt.Println("   2. 把任务拆成更小的步骤分次执行；")

@@ -26,15 +26,15 @@ func NewApprover(in *bufio.Reader) *Approver {
 // 调用前应已打印工具标签（label），本函数在同行接上审批询问。
 func (a *Approver) Ask(name string, d tools.Decision) bool {
 	if d.Danger == "" && a.isApproved(d) {
-		fmt.Printf(" → %s\n", green("✓ 已授权自动放行"))
+		fmt.Printf(" → %s\n", greenC("✓ 已授权自动放行"))
 		return true
 	}
 
 	if d.Danger != "" {
-		fmt.Printf("\n   %s %s\n", red("⚠️ 高危："), d.Danger)
-		fmt.Printf("   %s", yellow("是否允许？[y]是 / [N]否 "))
+		fmt.Printf("\n   %s %s\n", redC("⚠️ 高危："), d.Danger)
+		fmt.Printf("   %s", yellowC("是否允许？[y]是 / [N]否 "))
 	} else {
-		fmt.Printf("%s", yellow(" ▶ [y]本次 / [a]始终允许 / [N]否 "))
+		fmt.Printf("%s", yellowC(" ▶ [y]本次 / [a]始终允许 / [N]否 "))
 	}
 
 	line, err := a.in.ReadString('\n')
@@ -73,10 +73,10 @@ func (a *Approver) remember(d tools.Decision) {
 	switch d.ScopeKind {
 	case "dir":
 		a.approvedDirs = append(a.approvedDirs, d.Scope)
-		fmt.Printf("   %s 目录 %s 及子目录\n", green("✓ 已记住"), dim(d.Scope))
+		fmt.Printf("   %s 目录 %s 及子目录\n", greenC("✓ 已记住"), dimC(d.Scope))
 	case "session":
 		a.approvedSess[d.Scope] = true
-		fmt.Printf("   %s\n", green("✓ 已记住会话"))
+		fmt.Printf("   %s\n", greenC("✓ 已记住会话"))
 	}
 }
 
