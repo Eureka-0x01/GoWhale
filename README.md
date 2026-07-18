@@ -17,8 +17,8 @@
 ### 从源码安装
 
 ```bash
-git clone git@github.com:Eureka-0x01/-GoWhale.git
-cd -GoWhale
+git clone git@github.com:Eureka-0x01/GoWhale.git
+cd GoWhale
 go install
 ```
 
