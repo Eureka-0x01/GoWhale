@@ -118,7 +118,11 @@ func completer(d prompt.Document) []prompt.Suggest {
 }
 
 func printBanner(cfg config.Config) {
-	fmt.Printf("GoWhale — AI 编程助手（%s / %s）\n", cfg.Model, cfg.ProModel)
+	provider := cfg.Provider
+	if provider == "" {
+		provider = "deepseek"
+	}
+	fmt.Printf("GoWhale — AI 编程助手 [%s]  %s / %s\n", provider, cfg.Model, cfg.ProModel)
 	fmt.Println(strings.Repeat("─", 48))
 	fmt.Println("输入任务开始。输入 / 查看命令（Tab/方向键选择，Enter 执行）。")
 	fmt.Println()
@@ -137,7 +141,11 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 
 	case "/model":
 		cfg := config.Load()
-		fmt.Printf("\n简单任务: %s\n复杂任务: %s\n\n", cfg.Model, cfg.ProModel)
+		provider := cfg.Provider
+		if provider == "" {
+			provider = "deepseek"
+		}
+		fmt.Printf("\n提供商: %s\n简单任务: %s\n复杂任务: %s\n\n", provider, cfg.Model, cfg.ProModel)
 
 	case "/clear":
 		fmt.Println("✓ 对话历史已清空。输入 /exit 退出后重新进即可完全重置。")
