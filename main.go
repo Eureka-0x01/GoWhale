@@ -161,6 +161,7 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 			}
 		}
 		ag.SwitchProvider(ollamaURL, "ollama", ollamaModel, ollamaModel)
+		config.SaveProvider("ollama")
 		fmt.Printf("✓ 已切换到 Ollama (%s)\n", ollamaModel)
 
 	case "/deepseek":
@@ -171,6 +172,7 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 			cfg2.Model,
 			cfg2.ProModel,
 		)
+		config.SaveProvider("deepseek")
 		fmt.Println("✓ 已切换到 DeepSeek")
 
 	case "/exit", "/quit":

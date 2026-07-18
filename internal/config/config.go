@@ -16,6 +16,7 @@ type Config struct {
 	ProModel    string
 	OllamaURL   string
 	OllamaModel string
+	Provider    string // 上次使用的提供商: deepseek / ollama
 	MaxTurns    int
 }
 
@@ -33,7 +34,16 @@ func Load() Config {
 		ProModel:    getenv("AICODE_PRO_MODEL", "deepseek-v4-pro"),
 		OllamaURL:   getenv("AICODE_OLLAMA_URL", ""),
 		OllamaModel: getenv("AICODE_OLLAMA_MODEL", ""),
+		Provider:    getenv("AICODE_PROVIDER", "deepseek"),
 		MaxTurns:    getenvInt("AICODE_MAX_TURNS", 40),
+	}
+
+	// 自动恢复上次使用的提供商
+	if cfg.Provider == "ollama" && cfg.OllamaURL != "" && cfg.OllamaModel != "" {
+		cfg.BaseURL = cfg.OllamaURL
+		cfg.APIKey = "ollama"
+		cfg.Model = cfg.OllamaModel
+		cfg.ProModel = cfg.OllamaModel
 	}
 
 	if cfg.APIKey == "" {
@@ -80,6 +90,30 @@ func PromptOllama(in *bufio.Reader) (url, model string) {
 	os.Setenv("AICODE_OLLAMA_URL", url)
 	os.Setenv("AICODE_OLLAMA_MODEL", model)
 	return
+}
+
+// SaveProvider 保存当前使用的提供商到 ~/.gowhale/.env。
+func SaveProvider(provider string) {
+	homeDir, _ := os.UserHomeDir()
+	savePath := filepath.Join(homeDir, ".gowhale", ".env")
+
+	existing, _ := os.ReadFile(savePath)
+	content := string(existing)
+
+	// 移除旧的 AICODE_PROVIDER 行
+	lines := strings.Split(content, "\n")
+	var newLines []string
+	for _, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "AICODE_PROVIDER") {
+			newLines = append(newLines, line)
+		}
+	}
+	content = strings.Join(newLines, "\n")
+
+	// 追加新的
+	content = strings.TrimRight(content, "\n") + fmt.Sprintf("\nAICODE_PROVIDER=%s\n", provider)
+	os.WriteFile(savePath, []byte(content), 0o600)
+	os.Setenv("AICODE_PROVIDER", provider)
 }
 
 func getenv(key, def string) string {
