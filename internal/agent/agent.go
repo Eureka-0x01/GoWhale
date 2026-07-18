@@ -53,7 +53,7 @@ const skillRules = "" +
 	"- **声称完成前**:read_file 确认改动、编译通过验证、所有 plan 步骤 done。\n" +
 	"- 先读后写:未读过的文件不要凭记忆猜测。\n" +
 	"- 审批被拒绝时解释原因、提供替代方案,不强行绕过。\n" +
-	"- 完成后用简洁的中文总结。"
+	"- 完成后用两句话总结做了什么，最后一行只写「执行完成」。注意：只说执行完成，不要再多说其他话。"
 
 // New 创建 Agent。maxTurns 为单次请求内的最大工具调用轮数。
 func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTurns int, workspace string, fastModel, proModel string) *Agent {
