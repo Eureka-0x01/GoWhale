@@ -121,7 +121,9 @@ func (a *Agent) Run(input string) {
 			a.journal.Tool(tc.Function.Name, compactArgs(tc.Function.Arguments))
 
 			fmt.Print(label + " ")
+			toolStop := a.spinner.Start("执行中")
 			result := a.doWithApproval(tc)
+			toolStop()
 			fmt.Printf("→ %s\n", statusLine(result))
 
 			if isError(result) {

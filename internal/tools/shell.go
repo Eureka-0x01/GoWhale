@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -98,29 +97,15 @@ func (ShellTool) Execute(args json.RawMessage) (string, error) {
 		close(done)
 	}()
 
-	// 进度指示：每 2 秒刷一个点，让用户知道命令还在跑
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	elapsed := 0
-
+	// 等待命令完成或超时（60 秒）。
+	// 进度反馈由 Agent 层的 spinner 统一管理，这里只做控制。
 	timeout := time.After(60 * time.Second)
-loop:
-	for {
-		select {
-		case <-done:
-			break loop
-		case <-ticker.C:
-			elapsed += 2
-			fmt.Fprintf(os.Stderr, "\r   ⏳ 已运行 %ds ...", elapsed)
-		case <-timeout:
-			fmt.Fprint(os.Stderr, "\n")
-			_ = ctxCmd.Process.Kill()
-			return "", fmt.Errorf("命令执行超时（60 秒）。→ 不要重试同样的命令。如果是长期服务请用 background=true；如果是命令卡住请换替代方案")
-		}
-	}
-	// 清除进度行
-	if elapsed > 0 {
-		fmt.Fprint(os.Stderr, "\r\033[K")
+	select {
+	case <-done:
+		// 正常完成
+	case <-timeout:
+		_ = ctxCmd.Process.Kill()
+		return "", fmt.Errorf("命令执行超时（60 秒）。→ 不要重试同样的命令。如果是长期服务请用 background=true；如果是命令卡住请换替代方案")
 	}
 
 	result := strings.TrimSpace(decodeOutput(out))
