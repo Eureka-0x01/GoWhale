@@ -8,14 +8,11 @@ import (
 	"time"
 )
 
-// Journal 把 Agent 的工作记录到工作目录下的 .aicode/journal.md，
-// 方便后续查阅，也会在下次启动时读回最近记录注入上下文。
 type Journal struct {
 	path    string
 	enabled bool
 }
 
-// NewJournal 在锁定工作区准备 .aicode/journal.md。
 func NewJournal(workspace string) *Journal {
 	dir := filepath.Join(workspace, ".aicode")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -39,22 +36,18 @@ func (j *Journal) append(line string) {
 	_, _ = f.WriteString(line)
 }
 
-// Task 记录一条新任务的开始。
 func (j *Journal) Task(input string) {
 	j.append(fmt.Sprintf("\n## %s  %s", time.Now().Format("2006-01-02 15:04:05"), input))
 }
 
-// Tool 记录一次工具调用。
 func (j *Journal) Tool(name, args string) {
 	j.append(fmt.Sprintf("- 🔧 %s %s", name, args))
 }
 
-// Note 记录一条备注（如总结、达到上限等）。
 func (j *Journal) Note(text string) {
 	j.append("- " + strings.ReplaceAll(strings.TrimSpace(text), "\n", " "))
 }
 
-// Recent 读取日志末尾最多 maxBytes 字节，用于注入历史上下文。
 func (j *Journal) Recent(maxBytes int) string {
 	if !j.enabled {
 		return ""
@@ -67,4 +60,51 @@ func (j *Journal) Recent(maxBytes int) string {
 		data = data[len(data)-maxBytes:]
 	}
 	return string(data)
+}
+
+// TaskEntry 一次对话任务的摘要。
+type TaskEntry struct {
+	Time    string
+	Task    string
+	Replies []string
+}
+
+// LastTasks 读取日志中最近 n 条任务记录。
+func (j *Journal) LastTasks(n int) []TaskEntry {
+	if !j.enabled {
+		return nil
+	}
+	data, err := os.ReadFile(j.path)
+	if err != nil {
+		return nil
+	}
+
+	var entries []TaskEntry
+	var current *TaskEntry
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "## ") {
+			// 新任务
+			parts := strings.SplitN(line[3:], "  ", 2)
+			if len(parts) >= 2 {
+				entries = append(entries, TaskEntry{Time: parts[0], Task: parts[1]})
+				current = &entries[len(entries)-1]
+			}
+		} else if strings.HasPrefix(line, "- ✅ ") && current != nil {
+			// AI 的回复
+			reply := strings.TrimPrefix(line, "- ✅ ")
+			current.Replies = append(current.Replies, reply)
+		}
+	}
+
+	// 取最后 n 条
+	if len(entries) > n {
+		return entries[len(entries)-n:]
+	}
+	return entries
 }

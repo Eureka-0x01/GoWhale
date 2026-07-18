@@ -21,6 +21,7 @@ var slashCommands = []prompt.Suggest{
 	{Text: "/model", Description: "查看当前模型"},
 	{Text: "/clear", Description: "清空对话历史"},
 	{Text: "/clear-key", Description: "清除已保存的 API Key"},
+	{Text: "/history", Description: "查看最近对话记录"},
 	{Text: "/compact", Description: "压缩上下文节省 token"},
 	{Text: "/ollama", Description: "切换使用 Ollama 本地模型"},
 	{Text: "/deepseek", Description: "切换使用 DeepSeek 云端模型"},
@@ -60,6 +61,7 @@ func main() {
 	}
 
 	printBanner(cfg)
+	printHistory(ag)
 
 	// 用 go-prompt 替代 bufio.Reader，支持 / 命令下拉 + 模糊搜索 + Tab/方向键选择 + 历史记录
 	p := prompt.New(
@@ -153,6 +155,9 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 	case "/clear-key":
 		clearAPIKey(in)
 
+	case "/history":
+		printHistory(ag)
+
 	case "/compact":
 		before := ag.TokenCount()
 		ag.Compact()
@@ -190,6 +195,27 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 		fmt.Printf("未知命令: %s\n", cmd)
 	}
 	return false
+}
+
+func printHistory(ag *agent.Agent) {
+	tasks := ag.LastTasks(3)
+	if len(tasks) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println(strings.Repeat("─", 48))
+	fmt.Println("最近对话：")
+	for _, t := range tasks {
+		fmt.Printf("  %s\n", t.Task)
+		for _, r := range t.Replies {
+			r = strings.TrimSpace(r)
+			if len(r) > 80 {
+				r = r[:80] + "…"
+			}
+			fmt.Printf("    ↳ %s\n", r)
+		}
+	}
+	fmt.Println(strings.Repeat("─", 48))
 }
 
 func clearAPIKey(in *bufio.Reader) {

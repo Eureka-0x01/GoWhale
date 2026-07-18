@@ -187,6 +187,11 @@ func (a *Agent) ProviderInfo() (name, baseURL, model, proModel string) {
 // TokenCount 返回已使用的总 token 数。
 func (a *Agent) TokenCount() int { return a.totalTokens }
 
+// LastTasks 返回最近 n 条任务记录。
+func (a *Agent) LastTasks(n int) []TaskEntry {
+	return a.journal.LastTasks(n)
+}
+
 // doWithApproval 查找工具、审批、执行，返回结果文本。
 func (a *Agent) doWithApproval(tc llm.ToolCall) string {
 	tool, ok := a.registry.Lookup(tc.Function.Name)
