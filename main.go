@@ -152,13 +152,13 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 		fmt.Printf("  节省: %s → %s token\n", llm.FormatTokens(before), llm.FormatTokens(after))
 
 	case "/ollama":
-		ag.SwitchProvider(
-			"http://localhost:11434/v1",
-			"ollama",
-			"qwen3-coder:30b",
-			"qwen3-coder:30b",
-		)
-		fmt.Println("✓ 已切换到 Ollama (qwen3-coder:30b)")
+		ollamaURL := os.Getenv("AICODE_OLLAMA_URL")
+		ollamaModel := os.Getenv("AICODE_OLLAMA_MODEL")
+		if ollamaURL == "" || ollamaModel == "" {
+			ollamaURL, ollamaModel = config.PromptOllama(in)
+		}
+		ag.SwitchProvider(ollamaURL, "ollama", ollamaModel, ollamaModel)
+		fmt.Printf("✓ 已切换到 Ollama (%s)\n", ollamaModel)
 
 	case "/deepseek":
 		cfg2 := config.Load()
