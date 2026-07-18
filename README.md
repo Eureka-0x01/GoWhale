@@ -137,7 +137,51 @@ internal/
     term.go                  ANSI 颜色 + 转圈动画
 ```
 
-## 后续可扩展（对齐 CodeWhale 完整形态）
+## 未来规划
+
+### 服务端（GoWhale Server）
+
+管理员部署在企业内部，集中管理：
+
+- **项目配置**：为不同代码仓库设置专属规则（编码规范、框架约束、API 约定）
+- **提示词模板**：统一管理 system prompt，注入企业最佳实践
+- **注意事项**：标记敏感文件、禁止操作、高危命令白名单
+- **模型路由**：根据任务复杂度自动分配模型
+- **API 端点**：`GET /projects/:name/rules` 返回 Markdown 规则文档
+
+### 客户端（GoWhale CLI）
+
+启动时自动从服务端拉取规则：
+
+```
+gowhale --server https://gowhale.internal:8080
+```
+
+1. 连接服务端，获取当前项目的规则配置
+2. 将服务端规则注入 system prompt（优先级高于本地规则）
+3. 所有代码生成、文件修改、命令执行都受服务端规则约束
+
+### 场景示例
+
+```
+# 服务端配置（admin 操作）
+POST /projects/api-server/rules
+{
+  "constitution": [
+    "所有 API 必须用 gin 框架",
+    "错误处理统一用 errors.Wrap",
+    "数据库查询必须带超时 context",
+    "禁止提交 .env 文件"
+  ]
+}
+
+# 客户端使用
+$ cd api-server
+$ gowhale "添加用户登录接口"
+→ 自动拉取服务端规则，生成的代码符合企业规范
+```
+
+## 短期待办
 
 - 把授权记忆持久化到磁盘，跨会话保留
 - 沙箱执行、side-git 快照与回滚
