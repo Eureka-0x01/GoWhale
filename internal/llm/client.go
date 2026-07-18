@@ -46,6 +46,13 @@ type ToolFunctionSchema struct {
 	Parameters  map[string]any `json:"parameters"`
 }
 
+// Usage 记录单次 API 调用的 token 消耗。
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
 // Client 封装对大模型的调用。
 type Client struct {
 	cfg  config.Config
@@ -72,30 +79,32 @@ type chatResponse struct {
 	Choices []struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
+	Usage *Usage `json:"usage,omitempty"`
 }
 
 // Chat 发送一轮对话（非流式）。带上 tools 后模型可能返回 tool_calls。
-func (c *Client) Chat(messages []Message, tools []Tool) (Message, error) {
+// 返回消息和 token 用量信息。
+func (c *Client) Chat(messages []Message, tools []Tool) (Message, Usage, error) {
 	body, err := json.Marshal(chatRequest{
 		Model:    c.cfg.Model,
 		Messages: messages,
 		Tools:    tools,
 	})
 	if err != nil {
-		return Message{}, err
+		return Message{}, Usage{}, err
 	}
 
 	url := strings.TrimRight(c.cfg.BaseURL, "/") + "/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return Message{}, err
+		return Message{}, Usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return Message{}, err
+		return Message{}, Usage{}, err
 	}
 	defer resp.Body.Close()
 
@@ -105,15 +114,27 @@ func (c *Client) Chat(messages []Message, tools []Tool) (Message, error) {
 		if readErr != nil {
 			detail = fmt.Sprintf("(读取错误体失败: %v)", readErr)
 		}
-		return Message{}, fmt.Errorf("大模型返回错误 %d: %s", resp.StatusCode, detail)
+		return Message{}, Usage{}, fmt.Errorf("大模型返回错误 %d: %s", resp.StatusCode, detail)
 	}
 
 	var parsed chatResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return Message{}, fmt.Errorf("解析响应失败: %w", err)
+		return Message{}, Usage{}, fmt.Errorf("解析响应失败: %w", err)
 	}
 	if len(parsed.Choices) == 0 {
-		return Message{}, fmt.Errorf("模型未返回任何内容")
+		return Message{}, Usage{}, fmt.Errorf("模型未返回任何内容")
 	}
-	return parsed.Choices[0].Message, nil
+	var usage Usage
+	if parsed.Usage != nil {
+		usage = *parsed.Usage
+	}
+	return parsed.Choices[0].Message, usage, nil
+}
+
+// formatTokens 将 token 数转为可读字符串。
+func FormatTokens(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%.1fk", float64(n)/1000)
 }

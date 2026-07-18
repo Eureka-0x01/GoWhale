@@ -21,6 +21,7 @@ var slashCommands = []prompt.Suggest{
 	{Text: "/model", Description: "查看当前模型"},
 	{Text: "/clear", Description: "清空对话历史"},
 	{Text: "/clear-key", Description: "清除已保存的 API Key"},
+	{Text: "/compact", Description: "压缩上下文节省 token"},
 	{Text: "/exit", Description: "退出程序"},
 }
 
@@ -67,7 +68,7 @@ func main() {
 			}
 
 			if strings.HasPrefix(input, "/") {
-				exit := handleCommand(input, reader)
+				exit := handleCommand(input, reader, ag)
 				if exit {
 					fmt.Println("再见！")
 					os.Exit(0)
@@ -88,7 +89,11 @@ func main() {
 		prompt.OptionHistory([]string{}),
 		prompt.OptionPrefixTextColor(prompt.Cyan),
 		prompt.OptionPreviewSuggestionTextColor(prompt.Blue),
+		// 选中项：白字深灰底，清晰可见
+		prompt.OptionSelectedSuggestionTextColor(prompt.White),
 		prompt.OptionSelectedSuggestionBGColor(prompt.DarkGray),
+		// 未选中项：白字黑底
+		prompt.OptionSuggestionTextColor(prompt.White),
 		prompt.OptionSuggestionBGColor(prompt.Black),
 		prompt.OptionLivePrefix(func() (string, bool) { return "你 > ", true }),
 		prompt.OptionCompletionWordSeparator(" "),
@@ -117,7 +122,7 @@ func printBanner(cfg config.Config) {
 	fmt.Println()
 }
 
-func handleCommand(input string, in *bufio.Reader) bool {
+func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 	cmd := strings.ToLower(strings.TrimSpace(input))
 	switch cmd {
 	case "/help":
@@ -125,7 +130,8 @@ func handleCommand(input string, in *bufio.Reader) bool {
 		for _, s := range slashCommands {
 			fmt.Printf("  %-14s %s\n", s.Text, s.Description)
 		}
-		fmt.Println("\n直接输入自然语言开始任务。复杂任务自动路由到 pro 模型。")
+		fmt.Printf("\n当前上下文用量: %s token\n", llm.FormatTokens(ag.TokenCount()))
+		fmt.Println("直接输入自然语言开始任务。复杂任务自动路由到 pro 模型。")
 
 	case "/model":
 		cfg := config.Load()
@@ -136,6 +142,12 @@ func handleCommand(input string, in *bufio.Reader) bool {
 
 	case "/clear-key":
 		clearAPIKey(in)
+
+	case "/compact":
+		before := ag.TokenCount()
+		ag.Compact()
+		after := ag.TokenCount()
+		fmt.Printf("  节省: %s → %s token\n", llm.FormatTokens(before), llm.FormatTokens(after))
 
 	case "/exit", "/quit":
 		return true

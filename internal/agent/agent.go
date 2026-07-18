@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"gowhale/internal/llm"
 	"gowhale/internal/tools"
@@ -12,16 +13,17 @@ import (
 
 // Agent 用工具调用循环驱动大模型完成任务。
 type Agent struct {
-	client     *llm.Client
-	registry   *tools.Registry
-	approver   *Approver
-	journal    *Journal
-	maxTurns   int
-	spinner    Spinner
-	history    []llm.Message
-	recentCmds map[string]int
-	fastModel  string // 快速模型（简单问题）
-	proModel   string // 复杂模型（多步推理/代码生成）
+	client      *llm.Client
+	registry    *tools.Registry
+	approver    *Approver
+	journal     *Journal
+	maxTurns    int
+	spinner     Spinner
+	history     []llm.Message
+	recentCmds  map[string]int
+	fastModel   string // 快速模型（简单问题）
+	proModel    string // 复杂模型（多步推理/代码生成）
+	totalTokens int    // 累计 token 消耗
 }
 
 const skillRules = "" +
@@ -101,16 +103,17 @@ func (a *Agent) Run(input string) {
 
 	for turn := 0; turn < a.maxTurns; turn++ {
 		stop := a.spinner.Start("思考中")
-		msg, err := a.client.Chat(a.history, defs)
+		msg, usage, err := a.client.Chat(a.history, defs)
 		stop()
 		if err != nil {
 			fmt.Printf("调用失败: %v\n", err)
 			return
 		}
+		a.totalTokens += usage.TotalTokens
 		a.history = append(a.history, msg)
 
 		if len(msg.ToolCalls) == 0 {
-			fmt.Printf("\n%s %s\n", bold(blue("AI >")), msg.Content)
+			fmt.Printf("\n%s %s  %s\n", bold(blue("AI >")), msg.Content, tokenBadge(a.totalTokens))
 			a.journal.Note("✅ " + msg.Content)
 			return
 		}
@@ -124,7 +127,7 @@ func (a *Agent) Run(input string) {
 			toolStop := a.spinner.Start("执行中")
 			result := a.doWithApproval(tc)
 			toolStop()
-			fmt.Printf("→ %s\n", statusLine(result))
+			fmt.Printf("→ %s  %s\n", statusLine(result), tokenBadge(a.totalTokens))
 
 			if isError(result) {
 				fmt.Printf("     %s\n", indentLines(result, 5))
@@ -138,6 +141,27 @@ func (a *Agent) Run(input string) {
 	}
 	a.hitLimit()
 }
+
+// Compact 压缩对话历史，保留系统提示和最近几轮，节省 token。
+func (a *Agent) Compact() {
+	if len(a.history) <= 4 {
+		return // 消息太少，不需要压缩
+	}
+	// 保留首条 system 消息 + 最近 2 条对话（user + assistant/tool）
+	keep := 3
+	if len(a.history) > keep+1 {
+		a.history = append(
+			a.history[:1],
+			a.history[len(a.history)-keep:]...,
+		)
+	}
+	a.totalTokens = 0 // 重置计数器
+	a.recentCmds = map[string]int{}
+	fmt.Printf("  %s 上下文已压缩，保留最近 %d 条消息\n", green("✓"), keep)
+}
+
+// TokenCount 返回已使用的总 token 数。
+func (a *Agent) TokenCount() int { return a.totalTokens }
 
 // doWithApproval 查找工具、审批、执行，返回结果文本。
 func (a *Agent) doWithApproval(tc llm.ToolCall) string {
@@ -196,6 +220,14 @@ func toolIcon(name string) string {
 	default:
 		return "🔹"
 	}
+}
+
+// tokenBadge 在行末显示 token 用量标记。
+func tokenBadge(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return dim(fmt.Sprintf("[📊 %s]", llm.FormatTokens(n)))
 }
 
 func compactArgs(raw string) string {
@@ -279,6 +311,10 @@ func indentLines(s string, spaces int) string {
 // classify 用 fast 模型判断用户请求是否复杂任务。
 // 只有复杂任务（多步推理/代码生成/调试）才值得切到 pro 模型。
 func (a *Agent) classify(input string) bool {
+	// 估算输入字符数，超过阈值直接切 pro 模型
+	if utf8.RuneCountInString(input) > 200 {
+		return true
+	}
 	// 保存当前模型，分类完恢复
 	origModel := a.client.Model()
 	a.client.SetModel(a.fastModel)
@@ -288,7 +324,7 @@ func (a *Agent) classify(input string) bool {
 		"复杂: 写代码、生成文件、修改多文件、调试错误、多步任务、需要推理规划、编译运行验证。" +
 		"\n\n用户请求: " + input + "\n\n只回答一个字: 简单 或 复杂"
 
-	msg, err := a.client.Chat([]llm.Message{{Role: "user", Content: classifyPrompt}}, nil)
+	msg, _, err := a.client.Chat([]llm.Message{{Role: "user", Content: classifyPrompt}}, nil)
 	if err != nil {
 		a.client.SetModel(origModel)
 		return false // 分类失败，保守用 fast
@@ -297,8 +333,9 @@ func (a *Agent) classify(input string) bool {
 	result := strings.ToLower(strings.TrimSpace(msg.Content))
 	isComplex := strings.Contains(result, "复杂")
 
-	fmt.Printf("%s\n", dim(fmt.Sprintf("复杂度: %s → %s", result,
-		map[bool]string{true: bold(blue("使用 " + a.proModel)), false: gray("使用 " + a.fastModel)}[isComplex])))
+	fmt.Printf("%s %s\n", dim(fmt.Sprintf("复杂度: %s → %s", result,
+		map[bool]string{true: bold(blue("使用 " + a.proModel)), false: gray("使用 " + a.fastModel)}[isComplex])),
+		tokenBadge(a.totalTokens))
 	a.client.SetModel(origModel) // 恢复，Run() 里会根据结果再设
 	return isComplex
 }
