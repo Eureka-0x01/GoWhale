@@ -56,11 +56,12 @@ func PromptOllama(in *bufio.Reader) (url, model string) {
 		url = "http://localhost:11434/v1"
 	}
 
-	fmt.Print("  模型名 [默认 qwen3-coder:30b]: ")
+	fmt.Print("  模型名（如 qwen3-coder:30b，用 ollama list 查看）: ")
 	input, _ = in.ReadString('\n')
 	model = strings.TrimSpace(input)
 	if model == "" {
-		model = "qwen3-coder:30b"
+		fmt.Println("  ✗ 模型名不能为空")
+		return "", ""
 	}
 
 	// 保存到 ~/.gowhale/.env

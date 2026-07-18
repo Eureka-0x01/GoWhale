@@ -156,6 +156,9 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 		ollamaModel := os.Getenv("AICODE_OLLAMA_MODEL")
 		if ollamaURL == "" || ollamaModel == "" {
 			ollamaURL, ollamaModel = config.PromptOllama(in)
+			if ollamaModel == "" {
+				break
+			}
 		}
 		ag.SwitchProvider(ollamaURL, "ollama", ollamaModel, ollamaModel)
 		fmt.Printf("✓ 已切换到 Ollama (%s)\n", ollamaModel)
