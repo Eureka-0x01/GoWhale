@@ -8,6 +8,42 @@
 属于 **CLI Coding Agent / AI 编程助手**。同类：Claude Code、Aider、Cursor、CodeWhale。
 核心是一个「**工具调用循环**」：模型不只是回答，还能通过工具读写文件、执行命令来真正完成任务。
 
+## 安装
+
+### 前置条件
+
+- Go 1.25+
+
+### 从源码安装
+
+```bash
+git clone git@github.com:Eureka-0x01/-GoWhale.git
+cd -GoWhale
+go install
+```
+
+安装后 `gowhale.exe` 会生成在 `$GOPATH/bin` 下，确保该目录在 PATH 中即可在任意位置调用。
+
+```bash
+# 确认安装成功
+gowhale --help
+```
+
+> 首次运行会提示输入 DeepSeek API Key（从 [platform.deepseek.com](https://platform.deepseek.com/api_keys) 获取），
+> 输入一次后会保存在 `~/.gowhale/.env`，后续无需重复输入。
+
+### 使用
+
+```bash
+# 一次性任务
+gowhale "在 demo 目录下生成一个 Go 版 hello world 并编译运行"
+
+# 交互式多轮（exit / /exit 退出）
+gowhale
+```
+
+交互模式下输入 `/` 可查看内置命令（补全、历史记录、模糊搜索）。
+
 ## 已实现的技能（工具）
 
 | 技能 | 说明 | 审批 |
@@ -77,16 +113,6 @@ Agent 会在**当前工作目录**下的 `.aicode/journal.md` 记录自己的工
 
 > 任务较大时可能触及轮数上限；届时程序会**保存进度并给出方案**（输入「继续」接续、
 > 拆分任务、或调高 `AICODE_MAX_TURNS`）。
-
-## 使用
-
-```bash
-# 一次性任务
-gowhale "在 demo 目录下生成一个 Go 版 hello world 并编译运行"
-
-# 交互式多轮（exit 退出）
-gowhale
-```
 
 ## 目录结构
 
