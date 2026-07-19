@@ -38,6 +38,10 @@ const skillRules = "" +
 	"   write_file 仅允许在只需修改 1 个文件时使用。违反此规则会导致工具调用轮次耗尽。\n" +
 	"2. 写入前先用 list_dir / read_file 了解项目结构,不要臆测。\n" +
 	"\n" +
+	"## Python 执行\n" +
+	"- 运行 Python 代码直接用 execute_python，**禁止**先写 .py 文件再执行。不需要把代码保存到工作目录。\n" +
+	"- execute_python 自带沙箱隔离，会自动创建临时目录并在执行后清理。\n" +
+	"\n" +
 	"## 命令执行纪律\n" +
 	"1. 执行构建/运行命令前,先用 read_file 确认相关配置文件。\n" +
 	"2. **启动服务必须设 background=true**。绝对不用 start/nohup/&。\n" +

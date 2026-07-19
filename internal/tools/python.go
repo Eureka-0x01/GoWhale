@@ -18,7 +18,7 @@ func (PythonTool) Name() string                    { return "execute_python" }
 func (PythonTool) Review(json.RawMessage) Decision { return Decision{} }
 
 func (PythonTool) Description() string {
-	return "在沙箱中执行 Python 代码。可导入安全模块(math/json/re/collections/datetime/itertools/functools/hashlib/base64/csv/xml/random/statistics/typing/enum/textwrap/pprint/decimal/fractions/string/struct/io/os.path-basename-dirname-join-splitext)。禁止: 系统调用/文件删除/网络/子进程。代码先经 AST 检查再在隔离目录运行。"
+	return "在隔离沙箱中直接执行 Python 代码（无需写 .py 文件到工作目录，直接传代码文本即可）。可导入安全模块(math/json/re/collections/datetime/itertools/functools/hashlib/base64/csv/xml/random/statistics/typing/enum/textwrap/pprint/decimal/fractions/string/struct/io/os.path-basename-dirname-join-splitext)。禁止: 系统调用/文件删除/网络/子进程。代码先经 AST 检查再在隔离目录运行。"
 }
 
 func (PythonTool) Schema() map[string]any {
