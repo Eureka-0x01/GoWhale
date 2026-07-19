@@ -142,11 +142,11 @@ func printBanner(cfg config.Config) {
 	}
 	// 第一行：主标题 + 版本号右对齐
 	line := fmt.Sprintf("GoWhale — AI 编程助手 [%s]  %s / %s", provider, cfg.Model, cfg.ProModel)
-	verTag := fmt.Sprintf("v%s", version)
+	verTag := fmt.Sprintf("  v%s", version)
 	width := 72
 	pad := width - displayWidth(line)
-	if pad < 2 {
-		pad = 2
+	if pad < len(verTag) {
+		pad = len(verTag)
 	}
 	fmt.Printf("%s%*s\n", line, pad, verTag)
 	fmt.Println(strings.Repeat("─", width))
