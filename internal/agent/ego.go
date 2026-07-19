@@ -16,9 +16,9 @@ import (
 // 参考 CodeWhale 的 .codewhale/constitution.json 设计。
 type Constitution struct {
 	SchemaVersion      int      `json:"schema_version"`
-	Authority          []string `json:"authority"`           // 冲突时的信息源优先级
+	Authority          []string `json:"authority"`            // 冲突时的信息源优先级
 	ProtectedInvariants []string `json:"protected_invariants"` // 不得破坏的规则
-	EscalateWhen       []string `json:"escalate_when"`        // 必须停下询问的场景
+	EscalateWhen       []string `json:"escalate_when"`         // 必须停下询问的场景
 	Verification       struct {
 		BeforeClaimingDone []string `json:"before_claiming_done"`
 	} `json:"verification_policy"`
@@ -83,7 +83,7 @@ func egoBlock(workspace string, c *Constitution) string {
 	abs, _ := filepath.Abs(workspace)
 	b.WriteString("<workspace_identity>\n")
 	b.WriteString(fmt.Sprintf("工作目录: %s | 操作系统: %s/%s\n", abs, runtime.GOOS, runtime.GOARCH))
-		b.WriteString(envBlock())
+	b.WriteString(envBlock())
 	b.WriteString("1. **所有文件操作和命令执行必须限定在当前工作目录内**。\n")
 	b.WriteString("2. **绝对禁止** cd 到其他目录进行操作、在其他目录创建项目、或用绝对路径指向外部。\n")
 	b.WriteString("3. 需要创建新项目时在当前工作目录下建子目录。越界操作会被系统直接拦截。\n")
@@ -197,11 +197,25 @@ func ensureDefaultConstitution(workspace string) {
 	_ = os.WriteFile(p, []byte(defaultConstitution), 0o644)
 }
 
-// envBlock 运行时动态检测执行环境，告诉模型用哪个 shell、有哪些可用命令。
+// envBlock 运行时动态检测执行环境，告诉模型操作系统、shell、可用命令。
+// 所有 shell 相关规则集中在此，避免 skillRules 硬编码假设。
 func envBlock() string {
 	var b strings.Builder
-	b.WriteString("执行环境（execute_shell 的 shell）:\n")
+	b.WriteString("## 运行环境（极其重要！所有命令必须适配此环境）\n\n")
 
+	// ── OS 基本信息 ──
+	osName := runtime.GOOS
+	switch osName {
+	case "windows":
+		osName = "Windows"
+	case "linux":
+		osName = "Linux"
+	case "darwin":
+		osName = "macOS"
+	}
+	b.WriteString(fmt.Sprintf("- 操作系统: %s (%s/%s)\n", osName, runtime.GOOS, runtime.GOARCH))
+
+	// ── Shell 检测 ──
 	shellName := "sh"
 	if runtime.GOOS == "windows" {
 		if _, err := exec.LookPath("sh"); err != nil {
@@ -212,20 +226,37 @@ func envBlock() string {
 			shellName = "bash"
 		}
 	}
-	b.WriteString(fmt.Sprintf("- Shell: %s (不是 cmd.exe! 不要用 start/dir/findstr/cd /d 等 cmd 语法)\n", shellName))
+	b.WriteString(fmt.Sprintf("- Shell: %s\n", shellName))
 
-	// 列出系统中实际可用的关键命令
-	for _, cmd := range []string{"go", "java", "mvn", "python3", "python", "node", "npm", "git", "curl"} {
+	// ── OS 特定命令对照 ──
+	if shellName == "sh" || shellName == "bash" {
+		b.WriteString("- 命令使用 sh/bash 语法（Unix 风格）:\n")
+		b.WriteString("  列目录=ls | 搜索文本=grep | 查看文件=cat | 删除=rm | 移动=mv | 复制=cp\n")
+		b.WriteString("  重定向 stderr: 2>&1 | 丢弃输出: >/dev/null 2>&1\n")
+		b.WriteString("  路径分隔符: / | 多个命令: && 或 ; | 变量: $VAR\n")
+	} else {
+		b.WriteString("- 命令使用 cmd 语法（Windows 风格）:\n")
+		b.WriteString("  列目录=dir | 搜索文本=findstr | 查看文件=type | 删除=del | 移动=move | 复制=copy\n")
+		b.WriteString("  重定向 stderr: 2>&1 | 丢弃输出: >nul 2>nul\n")
+		b.WriteString("  路径分隔符: \\ | 多个命令: && 或 & | 变量: %VAR%\n")
+	}
+
+	// ── 可用工具 ──
+	b.WriteString("- 已检测到的开发工具: ")
+	found := false
+	for _, cmd := range []string{"go", "java", "mvn", "python3", "python", "node", "npm", "git", "curl", "docker", "make", "cargo", "rustc"} {
 		if _, err := exec.LookPath(cmd); err == nil {
-			b.WriteString(fmt.Sprintf("- %s: 可用\n", cmd))
+			if found {
+				b.WriteString(", ")
+			}
+			b.WriteString(cmd)
+			found = true
 		}
 	}
-
-	if shellName == "sh" || shellName == "bash" {
-		b.WriteString("- 命令语法: sh/bash。grep 而非 findstr, cat 而非 type, ls 而非 dir, 2>/dev/null 而非 2>nul\n")
-		b.WriteString("- 长期服务用 background=true, 绝对不用 start 或 nohup\n")
-	} else {
-		b.WriteString("- 命令语法: cmd。用 dir/findstr/type/2>nul, 不用 grep/ls/cat\n")
+	if !found {
+		b.WriteString("(无)")
 	}
+	b.WriteString("\n")
+
 	return b.String()
 }

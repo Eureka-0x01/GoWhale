@@ -27,12 +27,10 @@ type Agent struct {
 }
 
 const skillRules = "" +
-	"## 运行环境(极其重要!)\n" +
-	"- 你的命令在 sh/bash 中执行,不是 cmd.exe。即使 Windows 也用 sh 语法。\n" +
-	"- Windows 下用: ls 而非 dir, grep 而非 findstr, cd /path 而非 cd /d X:\\path\n" +
-	"- 重定向用 2>&1 而非 2>nul。不用 < 输入重定向(sh 不认)。\n" +
-	"- **绝对不用 start**——它是 cmd 命令,sh 不认。长期服务用 background=true。\n" +
-	"- 你已在工作目录中,直接执行命令即可,不需要开头加 cd。\n" +
+	"## 运行环境\n" +
+	"- shell 类型和可用命令参见上方执行环境信息，严格按照检测到的 shell 写命令。\n" +
+	"- 长期服务用 background=true，绝对不用 start/nohup/&。\n" +
+	"- 你已在工作目录中，直接执行命令即可，不需要开头加 cd。\n" +
 	"\n" +
 	"## 文件操作\n" +
 	"1. **绝对禁止**逐文件调用 write_file。创建/修改 2 个及以上文件时，**第一个工具调用**就必须是 batch_write。\n" +
