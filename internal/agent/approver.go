@@ -23,10 +23,10 @@ func NewApprover(in *bufio.Reader) *Approver {
 }
 
 // Ask 根据审批决策决定是否放行。
-// 调用前应已打印工具标签（label），本函数在同行接上审批询问。
+// 调用前已打印工具标签（label），本函数在**新行**接上审批询问。
 func (a *Approver) Ask(name string, d tools.Decision) bool {
 	if d.Danger == "" && a.isApproved(d) {
-		fmt.Printf(" → %s\n", greenC("✓ 已授权自动放行"))
+		fmt.Printf("\n   %s\n", greenC("→ ✓ 已授权自动放行"))
 		return true
 	}
 
@@ -34,7 +34,7 @@ func (a *Approver) Ask(name string, d tools.Decision) bool {
 		fmt.Printf("\n   %s %s\n", redC("⚠️ 高危："), d.Danger)
 		fmt.Printf("   %s", yellowC("是否允许？[y]是 / [N]否 "))
 	} else {
-		fmt.Printf("%s", yellowC(" ▶ [y]本次 / [a]始终允许 / [N]否 "))
+		fmt.Printf("\n   %s", yellowC("▶ [y]本次 / [a]始终允许 / [N]否 "))
 	}
 
 	line, err := a.in.ReadString('\n')

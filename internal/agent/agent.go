@@ -123,11 +123,9 @@ func (a *Agent) Run(input string) {
 			label := formatToolLabel(step, tc)
 			a.journal.Tool(tc.Function.Name, compactArgs(tc.Function.Arguments))
 
-			fmt.Print(label + " ")
-			toolStop := a.spinner.Start("执行中")
+			fmt.Print("\r" + label)
 			result := a.doWithApproval(tc)
-			toolStop()
-			fmt.Printf("→ %s  %s\n", statusLine(result), tokenBadge(a.totalTokens))
+			fmt.Printf("→ %s  %s\r\n", statusLine(result), tokenBadge(a.totalTokens))
 
 			if isError(result) {
 				fmt.Printf("     %s\n", indentLines(result, 5))
@@ -218,7 +216,10 @@ func (a *Agent) doWithApproval(tc llm.ToolCall) string {
 		}
 	}
 
+	// 审批通过后才启动 spinner，避免 spinner 的 \r 覆盖审批提示和用户输入
+	stop := a.spinner.Start("执行中")
 	out, err := tool.Execute(args)
+	stop()
 	if err != nil {
 		return "执行出错：" + err.Error()
 	}

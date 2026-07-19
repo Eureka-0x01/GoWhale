@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// SearchTool 联网搜索。优先用 DuckDuckGo JSON API，不可达时退到 HTML lite。
+// SearchTool 联网搜索。优先用 DuckDuckGo JSON API，不可达时退到百度。
 type SearchTool struct{}
 
 func (SearchTool) Name() string                   { return "web_search" }
@@ -36,21 +36,41 @@ func (SearchTool) Schema() map[string]any {
 
 func (SearchTool) Execute(args json.RawMessage) (string, error) {
 	var p struct {
-		Query string `json:"query"`
+		Query       string                   `json:"query"`
+		Q           string                   `json:"q"`
+		SearchQuery []map[string]interface{} `json:"search_query"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
-		return "", fmt.Errorf("参数解析失败: %w", err)
-	}
-	q := strings.TrimSpace(p.Query)
-	if q == "" {
-		return "", fmt.Errorf("query 不能为空")
+		// 输出原始参数方便诊断
+		raw := string(args)
+		if raw == "" {
+			raw = "(空字符串)"
+		}
+		return "", fmt.Errorf("参数解析失败: %w\n原始参数: %s", err, raw)
 	}
 
-	// 方案 A: DuckDuckGo JSON API（国外快，国内可能慢/不通）
+	// 兼容多种参数名：query > q > search_query[0].q > search_query[0].query
+	q := strings.TrimSpace(p.Query)
+	if q == "" {
+		q = strings.TrimSpace(p.Q)
+	}
+	if q == "" && len(p.SearchQuery) > 0 {
+		if sq, ok := p.SearchQuery[0]["q"].(string); ok {
+			q = strings.TrimSpace(sq)
+		} else if sq, ok := p.SearchQuery[0]["query"].(string); ok {
+			q = strings.TrimSpace(sq)
+		}
+	}
+	if q == "" {
+		return "", fmt.Errorf("query 不能为空（原始参数: %s）", string(args))
+	}
+
+	// 方案 A: DuckDuckGo JSON API（国外快，国内可能不通）
 	result, err := searchDDGJSON(q)
 	if err == nil {
 		return result, nil
 	}
+	// DDG 不通时静默回退，不打印错误
 
 	// 方案 B: 百度（国内可用）
 	return searchBaidu(q)
@@ -62,10 +82,16 @@ func searchDDGJSON(query string) (string, error) {
 	client := &http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Get(apiURL)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("DDG 请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
+
+	// 检查是否返回了非 JSON（如 HTML 错误页）
+	if len(body) == 0 || body[0] != '{' {
+		return "", fmt.Errorf("DDG 返回非 JSON 响应 (HTTP %d, 前100字节: %s)",
+			resp.StatusCode, safePrefix(string(body), 100))
+	}
 
 	var ddg struct {
 		Abstract    string `json:"Abstract"`
@@ -77,7 +103,7 @@ func searchDDGJSON(query string) (string, error) {
 		} `json:"RelatedTopics"`
 	}
 	if err := json.Unmarshal(body, &ddg); err != nil {
-		return "", err
+		return "", fmt.Errorf("DDG JSON 解析失败: %w", err)
 	}
 
 	var out strings.Builder
@@ -197,3 +223,10 @@ func cleanHTML(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// safePrefix 安全截取字符串前 n 字节。
+func safePrefix(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
