@@ -15,6 +15,9 @@ import (
 	"gowhale/internal/tools"
 )
 
+// version 当前版本号，初始 0.1，后续手动升级。
+const version = "0.1"
+
 // slashCommands 所有 / 命令及其描述（用于下拉和建议）
 var slashCommands = []prompt.Suggest{
 	{Text: "/help", Description: "帮助信息"},
@@ -119,13 +122,34 @@ func completer(d prompt.Document) []prompt.Suggest {
 	return nil
 }
 
+// displayWidth 计算字符串在终端中的显示宽度（ASCII=1, CJK=2）。
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		if r <= 0x7F {
+			w++
+		} else {
+			w += 2
+		}
+	}
+	return w
+}
+
 func printBanner(cfg config.Config) {
 	provider := cfg.Provider
 	if provider == "" {
 		provider = "deepseek"
 	}
-	fmt.Printf("GoWhale — AI 编程助手 [%s]  %s / %s\n", provider, cfg.Model, cfg.ProModel)
-	fmt.Println(strings.Repeat("─", 48))
+	// 第一行：主标题 + 版本号右对齐
+	line := fmt.Sprintf("GoWhale — AI 编程助手 [%s]  %s / %s", provider, cfg.Model, cfg.ProModel)
+	verTag := fmt.Sprintf("v%s", version)
+	width := 72
+	pad := width - displayWidth(line)
+	if pad < 2 {
+		pad = 2
+	}
+	fmt.Printf("%s%*s\n", line, pad, verTag)
+	fmt.Println(strings.Repeat("─", width))
 	fmt.Println("输入任务开始。输入 / 查看命令（Tab/方向键选择，Enter 执行）。")
 	fmt.Println()
 }
