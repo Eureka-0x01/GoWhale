@@ -123,7 +123,7 @@ func (PythonTool) Execute(args json.RawMessage) (string, error) {
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("参数解析失败: %w", err)
 	}
-	code := strings.TrimSpace(p.Code)
+	code := sanitizeCode(p.Code)
 	if code == "" {
 		return "", fmt.Errorf("code 不能为空")
 	}
@@ -216,4 +216,17 @@ func checkPythonAST(code string) error {
 		return fmt.Errorf("AST 检查异常: %s", result)
 	}
 	return nil
+}
+
+// sanitizeCode 清理模型生成的 Python 代码中可能含有的非法 Unicode 字符。
+// LLM 有时会输出 lone surrogate（如 \udcae），导致 Python UTF-8 编码器报错。
+// 过滤所有代理字符 (U+D800-U+DFFF) 并 trim 空白。
+func sanitizeCode(raw string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if r >= 0xD800 && r <= 0xDFFF {
+			return -1
+		}
+		return r
+	}, raw)
+	return strings.TrimSpace(cleaned)
 }
