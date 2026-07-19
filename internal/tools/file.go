@@ -64,7 +64,7 @@ type WriteFileTool struct{}
 func (WriteFileTool) Name() string { return "write_file" }
 
 func (WriteFileTool) Description() string {
-	return "把内容写入本地文件（覆盖写）。会自动创建所需的父目录。用于生成或修改代码文件。"
+	return "写入**单个**文件（覆盖写）。自动创建父目录。⚠️ 仅用于只需写 1 个文件的场景。如需创建/修改 2 个及以上文件，必须用 batch_write 一次完成，逐个调用 write_file 会严重浪费工具调用轮次。"
 }
 
 // Review 让 write_file 走审批门。作用域按「目录」记忆：
@@ -121,7 +121,7 @@ func (WriteFileTool) Execute(args json.RawMessage) (string, error) {
 	if err := os.WriteFile(p.Path, []byte(p.Content), 0o644); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已写入文件 %s（%d 字节）", p.Path, len(p.Content)), nil
+	return fmt.Sprintf("已写入文件 %s（%d 字节）。如需写更多文件请用 batch_write 一次完成。", p.Path, len(p.Content)), nil
 }
 
 // ---------- 批量写文件 ----------
@@ -131,9 +131,9 @@ type BatchWriteTool struct{}
 func (BatchWriteTool) Name() string { return "batch_write" }
 
 func (BatchWriteTool) Description() string {
-	return "一次写入多个文件。每次创建一个文件的时间/审批成本太高时优先用这个。" +
-		"传入一个文件列表，每项包含 path（文件路径）和 content（文本内容）。" +
-		"会自动创建所有需要的父目录。"
+	return "一次写入多个文件。当你需要创建或修改 2 个及以上文件时，**必须**用这个工具。传入文件列表，每项包含 path（文件路径）和 content（文本内容）。自动创建父目录。一次调用完成所有文件，避免多次审批和浪费工具调用轮次。"
+
+
 }
 
 func (BatchWriteTool) Review(args json.RawMessage) Decision {
