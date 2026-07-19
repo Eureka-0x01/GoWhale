@@ -37,6 +37,8 @@ const skillRules = "" +
 	"   先把所有文件内容和路径准备好，用 batch_write 一次写入。不要循环调用 write_file。\n" +
 	"   write_file 仅允许在只需修改 1 个文件时使用。违反此规则会导致工具调用轮次耗尽。\n" +
 	"2. 写入前先用 list_dir / read_file 了解项目结构,不要臆测。\n" +
+	"3. **禁止猜测文件路径**。read_file / write_file 失败提示文件不存在时，立即用 list_dir 查看目录结构，不要换路径重试。\n" +
+	"   每次 read_file 失败都要先确认文件是否真实存在，否则会浪费大量工具调用轮次。\n" +
 	"\n" +
 	"## Python 执行\n" +
 	"- 运行 Python 代码直接用 execute_python，**禁止**先写 .py 文件再执行。不需要把代码保存到工作目录。\n" +
