@@ -37,7 +37,7 @@ func (a *Approver) Ask(name string, d tools.Decision) bool {
 		fmt.Printf("\n   %s", yellowC("▶ [y]本次 / [a]始终允许 / [N]否 "))
 	}
 
-	line, err := a.in.ReadString('\n')
+	line, err := readLine(a.in)
 	if err != nil {
 		return false
 	}
@@ -53,6 +53,36 @@ func (a *Approver) Ask(name string, d tools.Decision) bool {
 	default:
 		return false
 	}
+}
+
+// readLine 从 bufio.Reader 读取一行。
+// 兼容 go-prompt 设置的 Windows 终端 raw mode：
+// 在 raw mode 下 Enter 只发送 \r，不是 \n，所以不能用 ReadString('\n')。
+// 逐字节读取，遇到 \r 或 \n 结束，同时处理 \r\n 组合。
+func readLine(r *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == '\r' {
+			// Windows raw mode: Enter 发 \r
+			// 尝试吃掉紧跟的 \n（cooked mode 下 Enter 发 \r\n）
+			next, err := r.ReadByte()
+			if err != nil || next != '\n' {
+				if err == nil {
+					r.UnreadByte()
+				}
+			}
+			break
+		}
+		if b == '\n' {
+			break
+		}
+		buf = append(buf, b)
+	}
+	return string(buf), nil
 }
 
 func (a *Approver) isApproved(d tools.Decision) bool {
