@@ -16,7 +16,7 @@ import (
 )
 
 // version 当前版本号，初始 0.1，后续手动升级。
-const version = "0.1"
+const version = "0.2"
 
 // slashCommands 所有 / 命令及其描述（用于下拉和建议）
 var slashCommands = []prompt.Suggest{
