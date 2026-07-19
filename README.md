@@ -8,6 +8,18 @@
 属于 **CLI Coding Agent / AI 编程助手**。同类：Claude Code、Aider、Cursor、CodeWhale。
 核心是一个「**工具调用循环**」：模型不只是回答，还能通过工具读写文件、执行命令来真正完成任务。
 
+## 支持的模型提供商
+
+| 提供商 | 状态 | 说明 |
+|--------|------|------|
+| **DeepSeek** | ✅ 已支持 | 默认提供商，内置测试 Key，开箱即用 |
+| **Ollama** | ✅ 已支持 | 本地部署，切换命令 `/ollama`，需安装 Ollama |
+| OpenAI | 🚧 计划中 | OpenAI 兼容 API，框架已就绪 |
+| 其他兼容 | 🚧 计划中 | 任何 OpenAI 兼容 API 均可接入 |
+
+> 通过 OpenAI 兼容协议接入，`llm/client.go` 已是标准格式。切换提供商只需设置环境变量：
+> `AICODE_BASE_URL`、`AICODE_MODEL`、`AICODE_API_KEY`。
+
 ## 安装
 
 ### 前置条件
