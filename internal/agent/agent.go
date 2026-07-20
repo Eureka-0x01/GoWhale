@@ -11,6 +11,10 @@ import (
 	"gowhale/internal/tools"
 )
 
+// MaxToolCalls 单次任务总工具调用次数上限（含只读工具）。
+// 留 3 次余量给只读调研，实际写入窗口约 9 次。
+const MaxToolCalls = 12
+
 // Agent 用工具调用循环驱动大模型完成任务。
 type Agent struct {
 	client      *llm.Client
@@ -32,13 +36,26 @@ const skillRules = "" +
 	"- 长期服务用 background=true，绝对不用 start/nohup/&。\n" +
 	"- 你已在工作目录中，直接执行命令即可，不需要开头加 cd。\n" +
 	"\n" +
-	"## 文件操作\n" +
-	"1. **绝对禁止**逐文件调用 write_file。创建/修改 2 个及以上文件时，**第一个工具调用**就必须是 batch_write。\n" +
-	"   先把所有文件内容和路径准备好，用 batch_write 一次写入。不要循环调用 write_file。\n" +
-	"   write_file 仅允许在只需修改 1 个文件时使用。违反此规则会导致工具调用轮次耗尽。\n" +
-	"2. 写入前先用 list_dir / read_file 了解项目结构,不要臆测。\n" +
-	"3. **禁止猜测文件路径**。read_file / write_file 失败提示文件不存在时，立即用 list_dir 查看目录结构，不要换路径重试。\n" +
+	"## 文件操作（CRITICAL — 最高优先级）\n" +
+	"### 强制批量写入规则\n" +
+	"1. **严禁对多个文件依次调用 write_file 工具**。每次模型响应中，针对 write_file 或 batch_write 的调用，最多只能出现 1 次。\n" +
+	"2. 如果你的任务需要创建或修改 **2 个及以上**的文件，**必须**使用 batch_write 工具。\n" +
+	"   batch_write 的 `files` 参数是一个 JSON 对象(Map)，键为文件路径（相对根目录），值为文件完整内容，一次性提交所有文件。\n" +
+	"3. write_file **仅限**只需写 1 个文件时使用。任何多文件场景使用 write_file 都是违规。\n" +
+	"4. 在执行写入前，请先通过 read_file 和 list_dir 完成所有调研，制定完整计划，然后**一次性执行** batch_write。\n" +
+	"   禁止「写 A → 读 A → 写 B」的循环操作模式。\n" +
+	"5. 写入前先用 list_dir / read_file 了解项目结构，不要臆测。\n" +
+	"6. **禁止猜测文件路径**。read_file / write_file 失败提示文件不存在时，立即用 list_dir 查看目录结构，不要换路径重试。\n" +
 	"   每次 read_file 失败都要先确认文件是否真实存在，否则会浪费大量工具调用轮次。\n" +
+	"\n" +
+	"### 多文件创建示例（必须遵循）\n" +
+	"**正确做法**——一次性 batch_write：\n" +
+	"用户请求：「创建一个 index.html, style.css, app.js」\n" +
+	"你的响应中必须有且仅有一个 batch_write 调用：\n" +
+	"```json\n" +
+	"{\"tool_calls\":[{\"name\":\"batch_write\",\"arguments\":{\"files\":{\"index.html\":\"<html>...</html>\",\"style.css\":\"body{...}\",\"app.js\":\"console.log('hi');\"}}}]}\n" +
+	"```\n" +
+	"**错误做法**——绝对禁止：分三次调用 write_file。（这会导致工具调用轮次耗尽，任务强制终止）\n" +
 	"\n" +
 	"## Python 执行\n" +
 	"- 运行 Python 代码直接用 execute_python，**禁止**先写 .py 文件再执行。不需要把代码保存到工作目录。\n" +
@@ -54,6 +71,11 @@ const skillRules = "" +
 	"## 任务拆解\n" +
 	"1. 3 步以上的复杂任务,**第一个动作**必须是 write_plan 写出计划。\n" +
 	"2. 每完成一步,write_plan 更新状态。\n" +
+	"\n" +
+	"## 工具调用预算\n" +
+	"- 单次任务总工具调用次数限制为 12 次（含只读工具）。\n" +
+	"- 当剩余调用次数不足 3 次时，系统会拒绝多个 write_file 调用并要求你合并为 batch_write。\n" +
+	"- 合理规划：调研阶段用 2-3 次（list_dir + read_file），然后 1 次 batch_write 完成所有文件。\n" +
 	"\n" +
 	"## 验证与完成\n" +
 	"- **声称完成前**:read_file 确认改动、编译通过验证、所有 plan 步骤 done。\n" +
@@ -106,6 +128,7 @@ func (a *Agent) Run(input string) {
 	a.history = append(a.history, llm.Message{Role: "user", Content: input})
 	defs := a.registry.Definitions()
 	step := 0
+	callCount := 0
 
 	for turn := 0; turn < a.maxTurns; turn++ {
 		stop := a.spinner.Start("思考中")
@@ -124,7 +147,50 @@ func (a *Agent) Run(input string) {
 			return
 		}
 
+		// ── 工具调用预算检查 ──
+		if callCount >= MaxToolCalls {
+			// 已达硬上限，强制终止
+			for _, tc := range msg.ToolCalls {
+				a.history = append(a.history, llm.Message{
+					Role:       "tool",
+					ToolCallID: tc.ID,
+					Content:    "已达到最大工具调用次数限制，任务终止。",
+				})
+			}
+			a.hitLimit()
+			return
+		}
+		if callCount >= MaxToolCalls-2 {
+			hasBatchWrite := false
+			writeFileCount := 0
+			for _, tc := range msg.ToolCalls {
+				if tc.Function.Name == "batch_write" {
+					hasBatchWrite = true
+				}
+				if tc.Function.Name == "write_file" {
+					writeFileCount++
+				}
+			}
+			// 预算紧张（剩余 < 3 次）且模型还在逐个写文件 → 拦截
+			if !hasBatchWrite && writeFileCount > 0 {
+				warning := "工具预算警告：剩余调用次数不足。请立即将未完成的所有文件合并为一次 batch_write 调用并重新提交，否则任务将强制终止。"
+				for _, tc := range msg.ToolCalls {
+					step++
+					label := formatToolLabel(step, tc)
+					fmt.Print("\r" + label)
+					fmt.Printf("→ %s  %s\r\n", yellowC("⚠️"), yellowC(warning))
+					a.history = append(a.history, llm.Message{
+						Role:       "tool",
+						ToolCallID: tc.ID,
+						Content:    warning,
+					})
+				}
+				continue // 跳过本批次，让模型看到警告后重新规划
+			}
+		}
+
 		for _, tc := range msg.ToolCalls {
+			callCount++
 			step++
 			label := formatToolLabel(step, tc)
 			a.journal.Tool(tc.Function.Name, compactArgs(tc.Function.Arguments))
@@ -271,15 +337,11 @@ func compactArgs(raw string) string {
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
 		return raw
 	}
-	if files, ok := m["files"].([]any); ok {
+	if files, ok := m["files"].(map[string]any); ok {
 		total := len(files)
 		names := make([]string, 0, 4)
-		for _, f := range files {
-			if fm, ok := f.(map[string]any); ok {
-				if p, ok := fm["path"].(string); ok {
-					names = append(names, p)
-				}
-			}
+		for p := range files {
+			names = append(names, p)
 		}
 		suffix := ""
 		if len(names) > 4 {
