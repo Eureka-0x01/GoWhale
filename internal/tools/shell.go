@@ -22,7 +22,7 @@ type ShellTool struct{}
 func (ShellTool) Name() string { return "execute_shell" }
 
 func (ShellTool) Description() string {
-	return "通过 sh/bash 执行命令（不是 cmd.exe）。即使 Windows 也用 sh 语法。长期服务必须设 background=true。执行前需审批。"
+	return "执行 shell 命令。Linux/macOS 用 sh，Windows 用 cmd。执行前需审批。长期服务设 background=true。"
 }
 
 // Review 让 execute_shell 走审批门：始终需要确认，并对危险命令给出警告原因。
@@ -46,9 +46,10 @@ func (ShellTool) Schema() map[string]any {
 		"properties": map[string]any{
 			"command": map[string]any{
 				"type":        "string",
-				"description": "要执行的 shell 命令（通过 sh/bash 运行，不是 cmd.exe）。" +
-					"Windows 也要用 sh 语法：ls 而非 dir，grep 而非 findstr，cd 而非 cd /d。" +
-					"重定向用 2>&1 而非 2>nul。不用 start（sh 不支持）。长期服务用 background=true。",
+				"description": "要执行的命令。根据上方运行环境中的操作系统和 shell 类型，使用对应的命令语法。" +
+					"Windows cmd 语法：dir, type, findstr, del, move, copy, echo %VAR%。" +
+					"Linux sh 语法：ls, cat, grep, rm, mv, cp, echo $VAR。" +
+					"长期服务用 background=true。",
 			},
 			"background": map[string]any{
 				"type":        "boolean",
@@ -79,13 +80,10 @@ func (ShellTool) Execute(args json.RawMessage) (string, error) {
 		return runBackground(p.Command), nil
 	}
 
-	// 统一用 sh -c 执行（Windows 下依赖 Git Bash 提供的 sh）。
+	// 统一用 sh -c 执行（Windows 下用 cmd /c）。
 	name, flag := "sh", "-c"
 	if runtime.GOOS == "windows" {
-		if _, err := exec.LookPath("sh"); err != nil {
-			// 没有 sh 时退回 cmd
-			name, flag = "cmd", "/c"
-		}
+		name, flag = "cmd", "/c"
 	}
 
 	ctxCmd := exec.Command(name, flag, p.Command)

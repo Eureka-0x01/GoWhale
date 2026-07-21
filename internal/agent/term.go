@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"sync"
@@ -90,4 +91,34 @@ func (s *Spinner) Start(prefix string) func() {
 			fmt.Print("\r\033[K")
 		}
 	}
+}
+
+// ---------- stdin 读取（Windows raw mode 兼容）----------
+
+// ReadStdinLine 从 bufio.Reader 读取一行。
+// 兼容 go-prompt 设置的 Windows 终端 raw mode：
+// 在 raw mode 下 Enter 只发送 \r，不是 \n。
+// 逐字节读取，遇到 \r 或 \n 结束，同时处理 \r\n 组合。
+func ReadStdinLine(r *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return "", err
+		}
+		if b == '\r' {
+			next, err := r.ReadByte()
+			if err != nil || next != '\n' {
+				if err == nil {
+					r.UnreadByte()
+				}
+			}
+			break
+		}
+		if b == '\n' {
+			break
+		}
+		buf = append(buf, b)
+	}
+	return string(buf), nil
 }

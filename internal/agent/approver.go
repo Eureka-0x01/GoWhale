@@ -1,112 +1,75 @@
 package agent
 
 import (
-	"bufio"
 	"fmt"
 	"path/filepath"
 	"strings"
-
-	"gowhale/internal/tools"
 )
 
 // Approver 负责在有副作用的操作执行前，向用户征求确认（审批门）。
 // 支持「始终允许」：按作用域（目录/会话）记住授权，之后同作用域操作自动放行。
-// 与主交互循环共用同一个 stdin reader，避免缓冲冲突。
+// 不直接读 stdin —— 由外部调用方（终端 goroutine 或 TUI）通过 SendDecision 注入决策。
 type Approver struct {
-	in           *bufio.Reader
-	approvedDirs []string        // 已授权的目录（前缀匹配，含子目录）
-	approvedSess map[string]bool // 已授权的会话级作用域（如 shell）
+	decisions    chan ApprovalReply // 外部注入决策
+	approvedDirs []string           // 已授权的目录（前缀匹配，含子目录）
+	approvedSess map[string]bool    // 已授权的会话级作用域（如 shell）
 }
 
-func NewApprover(in *bufio.Reader) *Approver {
-	return &Approver{in: in, approvedSess: map[string]bool{}}
+// NewApprover 创建审批器。
+func NewApprover() *Approver {
+	return &Approver{
+		decisions:    make(chan ApprovalReply, 1),
+		approvedSess: map[string]bool{},
+	}
+}
+
+// SendDecision 外部向审批器发送一个决策。非阻塞（buffer=1）。
+func (a *Approver) SendDecision(reply ApprovalReply) {
+	select {
+	case a.decisions <- reply:
+	default:
+	}
 }
 
 // Ask 根据审批决策决定是否放行。
-// 调用前已打印工具标签（label），本函数在**新行**接上审批询问。
-func (a *Approver) Ask(name string, d tools.Decision) bool {
-	if d.Danger == "" && a.isApproved(d) {
-		fmt.Printf("\n   %s\n", greenC("→ ✓ 已授权自动放行"))
+// 如果已通过「始终允许」记忆放行，直接返回 true 不等待。
+// 否则阻塞等待外部通过 SendDecision 注入决策。
+func (a *Approver) Ask(name string, warning string, scopeKind string, scope string) bool {
+	// 检查记忆
+	if warning == "" && a.isApproved(scopeKind, scope) {
 		return true
 	}
 
-	if d.Danger != "" {
-		fmt.Printf("\n   %s %s\n", redC("⚠️ 高危："), d.Danger)
-		fmt.Printf("   %s", yellowC("是否允许？[y]是 / [N]否 "))
-	} else {
-		fmt.Printf("\n   %s", yellowC("▶ [y]本次 / [a]始终允许 / [N]否 "))
+	// 阻塞等待外部决策
+	reply := <-a.decisions
+	if reply.Permanent && warning == "" {
+		a.remember(scopeKind, scope)
 	}
-
-	line, err := readLine(a.in)
-	if err != nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "y", "yes":
-		return true
-	case "a", "all":
-		if d.Danger != "" {
-			return false
-		}
-		a.remember(d)
-		return true
-	default:
-		return false
-	}
+	return reply.Allowed
 }
 
-// readLine 从 bufio.Reader 读取一行。
-// 兼容 go-prompt 设置的 Windows 终端 raw mode：
-// 在 raw mode 下 Enter 只发送 \r，不是 \n，所以不能用 ReadString('\n')。
-// 逐字节读取，遇到 \r 或 \n 结束，同时处理 \r\n 组合。
-func readLine(r *bufio.Reader) (string, error) {
-	var buf []byte
-	for {
-		b, err := r.ReadByte()
-		if err != nil {
-			return "", err
-		}
-		if b == '\r' {
-			// Windows raw mode: Enter 发 \r
-			// 尝试吃掉紧跟的 \n（cooked mode 下 Enter 发 \r\n）
-			next, err := r.ReadByte()
-			if err != nil || next != '\n' {
-				if err == nil {
-					r.UnreadByte()
-				}
-			}
-			break
-		}
-		if b == '\n' {
-			break
-		}
-		buf = append(buf, b)
-	}
-	return string(buf), nil
-}
-
-func (a *Approver) isApproved(d tools.Decision) bool {
-	switch d.ScopeKind {
+// isApproved 检查给定作用域是否已被「始终允许」记忆覆盖。
+func (a *Approver) isApproved(scopeKind, scope string) bool {
+	switch scopeKind {
 	case "dir":
 		for _, ad := range a.approvedDirs {
-			if underDir(d.Scope, ad) {
+			if underDir(scope, ad) {
 				return true
 			}
 		}
 	case "session":
-		return a.approvedSess[d.Scope]
+		return a.approvedSess[scope]
 	}
 	return false
 }
 
-func (a *Approver) remember(d tools.Decision) {
-	switch d.ScopeKind {
+// remember 将当前作用域加入「始终允许」记忆。
+func (a *Approver) remember(scopeKind, scope string) {
+	switch scopeKind {
 	case "dir":
-		a.approvedDirs = append(a.approvedDirs, d.Scope)
-		fmt.Printf("   %s 目录 %s 及子目录\n", greenC("✓ 已记住"), dimC(d.Scope))
+		a.approvedDirs = append(a.approvedDirs, scope)
 	case "session":
-		a.approvedSess[d.Scope] = true
-		fmt.Printf("   %s\n", greenC("✓ 已记住会话"))
+		a.approvedSess[scope] = true
 	}
 }
 
@@ -120,4 +83,15 @@ func underDir(target, base string) bool {
 		base += sep
 	}
 	return strings.HasPrefix(target, base)
+}
+
+// PrintPrompt 打印审批提示（供终端兼容模式使用）。
+// 在事件驱动模式下，TUI 自行渲染审批界面，不使用此方法。
+func PrintPrompt(name, warning string) string {
+	if warning != "" {
+		return fmt.Sprintf("\n   %s %s\n   %s\n",
+			redC("⚠️ 高危："), warning,
+			yellowC("是否允许？[y]是 / [N]否 "))
+	}
+	return fmt.Sprintf("\n   %s\n", yellowC("▶ [y]本次 / [a]始终允许 / [N]否 "))
 }

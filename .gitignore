@@ -1,5 +1,5 @@
 # 编译产物
-gowhale.exe
+gowhale*.exe
 
 # 工作区运行时数据（每个项目目录下自动生成）
 .aicode/
@@ -11,3 +11,12 @@ gowhale.exe
 .deepseek/instructions.md
 
 # Go
+.gocache/
+.go-cache/
+
+# 构建脚本
+rebuild.bat
+
+# 测试
+test_output/
+trim.txt

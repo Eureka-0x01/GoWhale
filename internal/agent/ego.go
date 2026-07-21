@@ -218,9 +218,7 @@ func envBlock() string {
 	// ── Shell 检测 ──
 	shellName := "sh"
 	if runtime.GOOS == "windows" {
-		if _, err := exec.LookPath("sh"); err != nil {
-			shellName = "cmd"
-		}
+		shellName = "cmd" // Windows 始终用 cmd，不依赖 Git Bash 的 sh
 	} else {
 		if _, err := exec.LookPath("bash"); err == nil {
 			shellName = "bash"
@@ -229,16 +227,17 @@ func envBlock() string {
 	b.WriteString(fmt.Sprintf("- Shell: %s\n", shellName))
 
 	// ── OS 特定命令对照 ──
-	if shellName == "sh" || shellName == "bash" {
+	if runtime.GOOS == "windows" {
+		b.WriteString("- ⚠️ 命令使用 cmd 语法（Windows），禁止用 Unix 命令:\n")
+		b.WriteString("  列目录=dir | 搜索文本=findstr | 查看文件=type | 删除=del | 移动=move | 复制=copy\n")
+		b.WriteString("  重定向: 2>&1 | 丢弃: >nul 2>nul | 管道: |\n")
+		b.WriteString("  路径分隔: \\ | 多命令: && | 变量: %VAR%\n")
+		b.WriteString("  🚫 绝对禁止: grep, sed, awk, cat, ls, rm, 2>/dev/null, ||\n")
+	} else {
 		b.WriteString("- 命令使用 sh/bash 语法（Unix 风格）:\n")
 		b.WriteString("  列目录=ls | 搜索文本=grep | 查看文件=cat | 删除=rm | 移动=mv | 复制=cp\n")
-		b.WriteString("  重定向 stderr: 2>&1 | 丢弃输出: >/dev/null 2>&1\n")
-		b.WriteString("  路径分隔符: / | 多个命令: && 或 ; | 变量: $VAR\n")
-	} else {
-		b.WriteString("- 命令使用 cmd 语法（Windows 风格）:\n")
-		b.WriteString("  列目录=dir | 搜索文本=findstr | 查看文件=type | 删除=del | 移动=move | 复制=copy\n")
-		b.WriteString("  重定向 stderr: 2>&1 | 丢弃输出: >nul 2>nul\n")
-		b.WriteString("  路径分隔符: \\ | 多个命令: && 或 & | 变量: %VAR%\n")
+		b.WriteString("  重定向: 2>&1 | 丢弃: >/dev/null 2>&1\n")
+		b.WriteString("  路径分隔: / | 多命令: && 或 ; | 变量: $VAR\n")
 	}
 
 	// ── 可用工具 ──

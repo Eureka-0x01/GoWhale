@@ -13,6 +13,7 @@ import (
 	"gowhale/internal/config"
 	"gowhale/internal/llm"
 	"gowhale/internal/tools"
+	"gowhale/ui"
 )
 
 // version 当前版本号，初始 0.1，后续手动升级。
@@ -53,20 +54,29 @@ func main() {
 	)
 
 	reader := bufio.NewReader(os.Stdin)
-	approver := agent.NewApprover(reader)
+	approver := agent.NewApprover()
 	workspace, _ := os.Getwd()
 	tools.SetWorkspace(workspace)
 	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
 
+	// ── 一次性任务 ──
 	if len(os.Args) > 1 {
+		// 检查是否 --tui 模式
+		if os.Args[1] == "--tui" {
+			if err := ui.Run(ag); err != nil {
+				fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
 		ag.Run(strings.Join(os.Args[1:], " "))
 		return
 	}
 
+	// ── 交互模式（默认 go-prompt）──
 	printBanner(cfg)
 	printHistory(ag)
 
-	// 用 go-prompt 替代 bufio.Reader，支持 / 命令下拉 + 模糊搜索 + Tab/方向键选择 + 历史记录
 	p := prompt.New(
 		func(input string) {
 			input = strings.TrimSpace(input)
@@ -88,7 +98,7 @@ func main() {
 				os.Exit(0)
 			}
 
-			fmt.Println() // 输入提交后换行
+			fmt.Println()
 			ag.Run(input)
 		},
 		completer,
@@ -96,21 +106,18 @@ func main() {
 		prompt.OptionHistory([]string{}),
 		prompt.OptionPrefixTextColor(prompt.Cyan),
 		prompt.OptionPreviewSuggestionTextColor(prompt.Blue),
-		// 选中项：白字深灰底，清晰可见
 		prompt.OptionSelectedSuggestionTextColor(prompt.White),
 		prompt.OptionSelectedSuggestionBGColor(prompt.DarkGray),
-		// 未选中项：白字黑底
 		prompt.OptionSuggestionTextColor(prompt.White),
 		prompt.OptionSuggestionBGColor(prompt.Black),
 		prompt.OptionLivePrefix(func() (string, bool) { return "你 > ", true }),
 		prompt.OptionCompletionWordSeparator(" "),
-		// Down 键触发补全激活，允许方向键导航补全列表
 		prompt.OptionCompletionOnDown(),
 	)
 	p.Run()
 }
 
-// completer 根据输入返回建议——空输入不弹出，/ 开头过滤。
+// completer 根据输入返回建议。
 func completer(d prompt.Document) []prompt.Suggest {
 	text := d.TextBeforeCursor()
 	if text == "" {
@@ -122,7 +129,11 @@ func completer(d prompt.Document) []prompt.Suggest {
 	return nil
 }
 
-// displayWidth 计算字符串在终端中的显示宽度（ASCII=1, CJK=2）。
+func dimC(s string) string {
+	if s == "" { return "" }
+	return "\033[2m" + s + "\033[0m"
+}
+
 func displayWidth(s string) int {
 	w := 0
 	for _, r := range s {
@@ -140,7 +151,6 @@ func printBanner(cfg config.Config) {
 	if provider == "" {
 		provider = "deepseek"
 	}
-	// 第一行：主标题 + 版本号右对齐
 	line := fmt.Sprintf("GoWhale — AI 编程助手 [%s]  %s / %s", provider, cfg.Model, cfg.ProModel)
 	verTag := fmt.Sprintf("  v%s", version)
 	width := 72
@@ -150,7 +160,7 @@ func printBanner(cfg config.Config) {
 	}
 	fmt.Printf("%s%*s\n", line, pad, verTag)
 	fmt.Println(strings.Repeat("─", width))
-	fmt.Println("输入任务开始。输入 / 查看命令（Tab/方向键选择，Enter 执行）。")
+	fmt.Println("输入任务开始。输入 / 查看命令。/tui 切换 TUI 模式。")
 	fmt.Println()
 }
 
@@ -163,14 +173,11 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 			fmt.Printf("  %-14s %s\n", s.Text, s.Description)
 		}
 		fmt.Printf("\n当前上下文用量: %s token\n", llm.FormatTokens(ag.TokenCount()))
-		fmt.Println("直接输入自然语言开始任务。复杂任务自动路由到 pro 模型。")
 
 	case "/model":
 		cfg := config.Load()
 		provider := cfg.Provider
-		if provider == "" {
-			provider = "deepseek"
-		}
+		if provider == "" { provider = "deepseek" }
 		fmt.Printf("\n提供商: %s\n简单任务: %s\n复杂任务: %s\n\n", provider, cfg.Model, cfg.ProModel)
 
 	case "/clear":
@@ -188,14 +195,18 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 		after := ag.TokenCount()
 		fmt.Printf("  节省: %s → %s token\n", llm.FormatTokens(before), llm.FormatTokens(after))
 
+	case "/tui":
+		fmt.Println("正在启动 TUI 模式...")
+		if err := ui.Run(ag); err != nil {
+			fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
+		}
+
 	case "/ollama":
 		ollamaURL := os.Getenv("AICODE_OLLAMA_URL")
 		ollamaModel := os.Getenv("AICODE_OLLAMA_MODEL")
 		if ollamaURL == "" || ollamaModel == "" {
 			ollamaURL, ollamaModel = config.PromptOllama(in)
-			if ollamaModel == "" {
-				break
-			}
+			if ollamaModel == "" { break }
 		}
 		ag.SwitchProvider(ollamaURL, "ollama", ollamaModel, ollamaModel)
 		config.SaveProvider("ollama")
@@ -203,12 +214,7 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 
 	case "/deepseek":
 		cfg2 := config.Load()
-		ag.SwitchProvider(
-			cfg2.BaseURL,
-			cfg2.APIKey,
-			cfg2.Model,
-			cfg2.ProModel,
-		)
+		ag.SwitchProvider(cfg2.BaseURL, cfg2.APIKey, cfg2.Model, cfg2.ProModel)
 		config.SaveProvider("deepseek")
 		fmt.Println("✓ 已切换到 DeepSeek")
 
@@ -223,23 +229,38 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 
 func printHistory(ag *agent.Agent) {
 	tasks := ag.LastTasks(3)
+	fmt.Println()
 	if len(tasks) == 0 {
+		// 首次使用——显示欢迎页
+		fmt.Println("  👋 欢迎使用 GoWhale！")
+		fmt.Println()
+		fmt.Println("  快速开始：")
+		fmt.Println("    直接输入任务，如「检查项目」「创建一个 hello world」")
+		fmt.Println("    输入 / 查看所有命令")
+		fmt.Println("    输入 /tui 切换到 TUI 分栏模式")
+		fmt.Println()
+		fmt.Println("  提示：")
+		fmt.Println("    · 只读操作自动放行，写文件/执行命令需审批确认")
+		fmt.Println("    · 审批时按 a = 本次会话始终允许，不再重复询问")
+		fmt.Println("    · 按 Tab 浏览命令补全")
+		fmt.Println()
 		return
 	}
-	fmt.Println()
+
 	fmt.Println(strings.Repeat("─", 48))
-	fmt.Println("最近对话：")
+	fmt.Println("📝 最近对话：")
 	for _, t := range tasks {
-		fmt.Printf("  %s\n", t.Task)
+		fmt.Printf("  %s\n", dimC(t.Task))
 		for _, r := range t.Replies {
 			r = strings.TrimSpace(r)
 			if len(r) > 80 {
 				r = r[:80] + "…"
 			}
-			fmt.Printf("    ↳ %s\n", r)
+			fmt.Printf("    ↳ %s\n", dimC(r))
 		}
 	}
 	fmt.Println(strings.Repeat("─", 48))
+	fmt.Println()
 }
 
 func clearAPIKey(in *bufio.Reader) {
@@ -253,14 +274,12 @@ func clearAPIKey(in *bufio.Reader) {
 		fmt.Println("没有已保存的 API Key（~/.gowhale/.env 不存在）。")
 		return
 	}
-
 	fmt.Print("确认要清除已保存的 API Key 吗？[y/N] ")
 	line, _ := in.ReadString('\n')
 	if strings.ToLower(strings.TrimSpace(line)) != "y" {
 		fmt.Println("已取消。")
 		return
 	}
-
 	if err := os.Remove(path); err != nil {
 		fmt.Fprintf(os.Stderr, "清除失败: %v\n", err)
 		os.Exit(1)

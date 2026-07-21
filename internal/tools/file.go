@@ -12,12 +12,15 @@ import (
 
 // ---------- 读文件 ----------
 
+// maxBatchRead 单次批量读取的最大文件数。
+const maxBatchRead = 20
+
 type ReadFileTool struct{}
 
 func (ReadFileTool) Name() string { return "read_file" }
 
 func (ReadFileTool) Description() string {
-	return "读取本地某个文件的文本内容。用于查看代码、配置等。超过 200 行的文件会自动截断为摘要+头尾。"
+	return "读取一个或多个文件的文本内容。传 `path` 读取单个文件；传 `paths`（字符串数组）批量读取多个文件一次完成。超过 200 行的文件自动截断为摘要+头尾；用 `start_line`+`max_lines` 指定行范围可绕过截断直接读取中间部分。"
 }
 
 func (ReadFileTool) Schema() map[string]any {
@@ -26,58 +29,154 @@ func (ReadFileTool) Schema() map[string]any {
 		"properties": map[string]any{
 			"path": map[string]any{
 				"type":        "string",
-				"description": "文件路径，可为相对路径或绝对路径",
+				"description": "单个文件路径（与 paths 二选一）。",
+			},
+			"paths": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "批量文件路径列表。需要读取 2 个及以上文件时应使用此参数，一次调用完成。最多 20 个。",
+			},
+			"start_line": map[string]any{
+				"type":        "integer",
+				"description": "起始行号（1-based），仅单文件 `path` 模式有效。指定后只返回该行起的内容，不触发大文件截断。",
+			},
+			"max_lines": map[string]any{
+				"type":        "integer",
+				"description": "最大返回行数，仅单文件 `path` 模式有效。默认 200（超过则触发截断），设为 0 无限制。",
 			},
 		},
-		"required": []string{"path"},
 	}
 }
 
 func (ReadFileTool) Execute(args json.RawMessage) (string, error) {
 	var p struct {
-		Path string `json:"path"`
+		Path      string   `json:"path"`
+		Paths     []string `json:"paths"`
+		StartLine int      `json:"start_line"`
+		MaxLines  int      `json:"max_lines"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("参数解析失败: %w", err)
 	}
-	if strings.TrimSpace(p.Path) == "" {
-		return "", errors.New("path 不能为空")
+
+	// ── 确定要读取的文件列表 ──
+	var fileList []string
+	if len(p.Paths) > 0 {
+		if len(p.Paths) > maxBatchRead {
+			return "", fmt.Errorf("单次最多读取 %d 个文件，你传了 %d 个。请拆成多次 read_file 调用", maxBatchRead, len(p.Paths))
+		}
+		fileList = p.Paths
+	} else if strings.TrimSpace(p.Path) != "" {
+		fileList = []string{p.Path}
+	} else {
+		return "", errors.New("path 或 paths 不能同时为空")
 	}
-	if err := CheckPath(p.Path); err != nil {
+
+	// ── 逐个读取并汇总 ──
+	var sb strings.Builder
+	successCount := 0
+	for _, fpath := range fileList {
+		if strings.TrimSpace(fpath) == "" {
+			continue
+		}
+		// start_line/max_lines 仅对单文件 path 模式生效
+		sl := 0
+		ml := 0
+		if len(fileList) == 1 {
+			sl = p.StartLine
+			ml = p.MaxLines
+		}
+		content, err := readOneFile(fpath, sl, ml)
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("--- %s ---\n[错误] %v\n\n", fpath, err))
+			continue
+		}
+		successCount++
+		if len(fileList) > 1 {
+			sb.WriteString(fmt.Sprintf("=== %s ===\n", fpath))
+		}
+		sb.WriteString(content)
+		if !strings.HasSuffix(content, "\n") {
+			sb.WriteString("\n")
+		}
+		if len(fileList) > 1 {
+			sb.WriteString("\n")
+		}
+	}
+
+	if successCount == 0 {
+		return "", fmt.Errorf("所有文件读取失败（共 %d 个）", len(fileList))
+	}
+
+	result := sb.String()
+	if len(result) > maxOutput {
+		result = result[:maxOutput] + "\n...(输出过长已截断)"
+	}
+	return result, nil
+}
+
+// readOneFile 读取单个文件，处理大文件溢出截断。
+// startLine: 1-based 起始行，0 表示从头开始。
+// maxLines: 最大行数，0 表示默认 200 行（触发截断）。
+func readOneFile(path string, startLine, maxLines int) (string, error) {
+	if err := CheckPath(path); err != nil {
 		return "", err
 	}
-	info, err := os.Stat(p.Path)
+	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
 	}
-	data, err := os.ReadFile(p.Path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
 
-	// ── 读取溢出（Read Spillover）：大文件返回摘要+头尾，避免撑爆上下文 ──
-	const spilloverLines = 200
 	content := string(data)
-	lines := strings.Split(content, "\n")
-	if len(lines) > spilloverLines {
+	allLines := strings.Split(content, "\n")
+	totalLines := len(allLines)
+
+	// ── 行范围模式：start_line 指定时直接切片返回，不触发截断 ──
+	if startLine > 0 {
+		if startLine > totalLines {
+			return "", fmt.Errorf("start_line %d 超出文件总行数 %d", startLine, totalLines)
+		}
+		startIdx := startLine - 1 // 转 0-based
+		endIdx := totalLines
+		if maxLines > 0 && startIdx+maxLines < totalLines {
+			endIdx = startIdx + maxLines
+		}
+		slice := strings.Join(allLines[startIdx:endIdx], "\n")
+		return fmt.Sprintf("文件：%s（总 %d 行，第 %d-%d 行）\n\n%s",
+			path, totalLines, startLine, endIdx, slice), nil
+	}
+
+	// ── max_lines 模式（无 start_line）：限制行数不触发截断 ──
+	if maxLines > 0 {
+		if maxLines > totalLines {
+			maxLines = totalLines
+		}
+		slice := strings.Join(allLines[:maxLines], "\n")
+		return fmt.Sprintf("文件：%s（总 %d 行，前 %d 行）\n\n%s",
+			path, totalLines, maxLines, slice), nil
+	}
+
+	// ── 默认模式：大文件返回摘要+头尾，避免撑爆上下文 ──
+	const spilloverLines = 200
+	if totalLines > spilloverLines {
 		headLines := 50
 		tailLines := 50
-		if len(lines) < headLines+tailLines {
+		if totalLines < headLines+tailLines {
 			headLines = spilloverLines / 2
 			tailLines = spilloverLines / 2
 		}
-		head := strings.Join(lines[:headLines], "\n")
-		tail := strings.Join(lines[len(lines)-tailLines:], "\n")
+		head := strings.Join(allLines[:headLines], "\n")
+		tail := strings.Join(allLines[totalLines-tailLines:], "\n")
 		return fmt.Sprintf(
-			"文件摘要：%s（总 %d 行，%d 字节）\n\n--- 前 %d 行 ---\n%s\n--- 后 %d 行 ---\n%s\n\n内容过长已截断。如需查看中间部分，请使用 grep_search 或指定参数重新读取。",
-			p.Path, len(lines), info.Size(), headLines, head, tailLines, tail,
+			"文件摘要：%s（总 %d 行，%d 字节）\n\n--- 前 %d 行 ---\n%s\n--- 后 %d 行 ---\n%s\n\n内容过长已截断。如需查看中间部分，请用 start_line+max_lines 指定行号重新读取。",
+			path, totalLines, info.Size(), headLines, head, tailLines, tail,
 		), nil
 	}
 
-	// 小文件直接返回
-	if len(content) > maxOutput {
-		content = content[:maxOutput] + "\n...(文件过长已截断)"
-	}
 	return content, nil
 }
 
@@ -343,7 +442,7 @@ type ListDirTool struct{}
 func (ListDirTool) Name() string { return "list_dir" }
 
 func (ListDirTool) Description() string {
-	return "列出某个目录下的文件和子目录。用于浏览项目结构。"
+	return "列出一个或多个目录下的文件和子目录。传 `path` 列单个；传 `paths`（字符串数组）批量列多个目录一次完成。"
 }
 
 func (ListDirTool) Schema() map[string]any {
@@ -352,7 +451,12 @@ func (ListDirTool) Schema() map[string]any {
 		"properties": map[string]any{
 			"path": map[string]any{
 				"type":        "string",
-				"description": "目录路径，默认为当前目录 .",
+				"description": "单个目录路径（与 paths 二选一），默认 .",
+			},
+			"paths": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "批量目录路径列表。需要列出 2 个及以上目录时应使用此参数，一次调用完成。最多 20 个。",
 			},
 		},
 	}
@@ -360,29 +464,55 @@ func (ListDirTool) Schema() map[string]any {
 
 func (ListDirTool) Execute(args json.RawMessage) (string, error) {
 	var p struct {
-		Path string `json:"path"`
+		Path  string   `json:"path"`
+		Paths []string `json:"paths"`
 	}
 	_ = json.Unmarshal(args, &p)
-	if strings.TrimSpace(p.Path) == "" {
-		p.Path = "."
+
+	var dirs []string
+	if len(p.Paths) > 0 {
+		if len(p.Paths) > maxBatchRead {
+			return "", fmt.Errorf("单次最多列出 %d 个目录，你传了 %d 个。请拆成多次 list_dir 调用", maxBatchRead, len(p.Paths))
+		}
+		dirs = p.Paths
+	} else {
+		if strings.TrimSpace(p.Path) == "" {
+			p.Path = "."
+		}
+		dirs = []string{p.Path}
 	}
-	if err := CheckPath(p.Path); err != nil {
-		return "", err
-	}
-	entries, err := os.ReadDir(p.Path)
-	if err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	for _, e := range entries {
-		if e.IsDir() {
-			b.WriteString("[目录] " + e.Name() + "/\n")
+
+	var sb strings.Builder
+	for _, dir := range dirs {
+		if strings.TrimSpace(dir) == "" {
+			continue
+		}
+		if err := CheckPath(dir); err != nil {
+			sb.WriteString(fmt.Sprintf("[%s] 错误: %v\n", dir, err))
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			sb.WriteString(fmt.Sprintf("[%s] 错误: %v\n", dir, err))
+			continue
+		}
+		if len(dirs) > 1 {
+			sb.WriteString(fmt.Sprintf("=== %s ===\n", dir))
+		}
+		if len(entries) == 0 {
+			sb.WriteString("(空目录)\n")
 		} else {
-			b.WriteString("[文件] " + e.Name() + "\n")
+			for _, e := range entries {
+				if e.IsDir() {
+					sb.WriteString("[目录] " + e.Name() + "/\n")
+				} else {
+					sb.WriteString("[文件] " + e.Name() + "\n")
+				}
+			}
+		}
+		if len(dirs) > 1 {
+			sb.WriteString("\n")
 		}
 	}
-	if b.Len() == 0 {
-		return "(空目录)", nil
-	}
-	return b.String(), nil
+	return sb.String(), nil
 }
