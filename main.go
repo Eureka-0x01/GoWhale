@@ -53,27 +53,44 @@ func main() {
 		tools.ListDirTool{},
 	)
 
-	reader := bufio.NewReader(os.Stdin)
 	approver := agent.NewApprover()
 	workspace, _ := os.Getwd()
 	tools.SetWorkspace(workspace)
 	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
 
-	// ── 一次性任务 ──
+	// ── 有参数 ──
 	if len(os.Args) > 1 {
-		// 检查是否 --tui 模式
+		// --classic → 旧 go-prompt 交互模式
+		if os.Args[1] == "--classic" {
+			runClassic(ag, cfg)
+			return
+		}
+		// --tui [task] → TUI 模式（可选附带初始任务）
 		if os.Args[1] == "--tui" {
-			if err := ui.Run(ag); err != nil {
+			task := ""
+			if len(os.Args) > 2 {
+				task = strings.Join(os.Args[2:], " ")
+			}
+			if err := ui.Run(ag, task); err != nil {
 				fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 				os.Exit(1)
 			}
 			return
 		}
+		// 一次性任务
 		ag.Run(strings.Join(os.Args[1:], " "))
 		return
 	}
 
-	// ── 交互模式（默认 go-prompt）──
+	// ── 无参数 → 默认 TUI 模式 ──
+	if err := ui.Run(ag, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// runClassic 启动传统的 go-prompt 交互模式（通过 --classic 参数进入）。
+func runClassic(ag *agent.Agent, cfg config.Config) {
 	printBanner(cfg)
 	printHistory(ag)
 
@@ -85,7 +102,7 @@ func main() {
 			}
 
 			if strings.HasPrefix(input, "/") {
-				exit := handleCommand(input, reader, ag)
+				exit := handleCommand(input, bufio.NewReader(os.Stdin), ag)
 				if exit {
 					fmt.Println("再见！")
 					os.Exit(0)
@@ -160,7 +177,7 @@ func printBanner(cfg config.Config) {
 	}
 	fmt.Printf("%s%*s\n", line, pad, verTag)
 	fmt.Println(strings.Repeat("─", width))
-	fmt.Println("输入任务开始。输入 / 查看命令。/tui 切换 TUI 模式。")
+	fmt.Println("输入任务开始。输入 / 查看命令。默认使用 TUI 模式，用 --classic 参数可进入此模式。")
 	fmt.Println()
 }
 
@@ -191,13 +208,17 @@ func handleCommand(input string, in *bufio.Reader, ag *agent.Agent) bool {
 
 	case "/compact":
 		before := ag.TokenCount()
-		ag.Compact()
+		didCompact := ag.Compact()
 		after := ag.TokenCount()
-		fmt.Printf("  节省: %s → %s token\n", llm.FormatTokens(before), llm.FormatTokens(after))
+		if didCompact {
+			fmt.Printf("  节省: %s → ~%s token\n", llm.FormatTokens(before), llm.FormatTokens(after))
+		} else {
+			fmt.Printf("  消息不足无需压缩（当前 %s token）\n", llm.FormatTokens(after))
+		}
 
 	case "/tui":
 		fmt.Println("正在启动 TUI 模式...")
-		if err := ui.Run(ag); err != nil {
+		if err := ui.Run(ag, ""); err != nil {
 			fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 		}
 

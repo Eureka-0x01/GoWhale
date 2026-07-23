@@ -63,8 +63,9 @@ var (
 
 func NewSidebar() Sidebar {
 	return Sidebar{
-		Active: "Work",
-		width:  24,
+		Visible: true,
+		Active:  "Work",
+		width:   24,
 	}
 }
 

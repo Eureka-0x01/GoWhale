@@ -440,20 +440,75 @@ func readTerminalApproval(f *os.File) ApprovalReply {
 
 // ── 原有公共方法（保持不变）──
 
-// Compact 压缩对话历史，保留系统提示和最近几轮，节省 token。
-func (a *Agent) Compact() {
-	if len(a.history) <= 4 {
-		return
+// compactKeep 压缩时保留的最近消息条数。
+const compactKeep = 20
+
+// Compact 压缩对话历史：保留 system prompt 和最近的消息，确保不截断 tool 配对。
+// 返回 true 表示实际执行了截断，false 表示消息不足无需压缩。
+func (a *Agent) Compact() bool {
+	n := len(a.history)
+	if n <= compactKeep+2 {
+		if a.totalTokens <= 0 && n > 2 {
+			a.totalTokens = estimateTokens(a.history)
+		}
+		return false
 	}
-	keep := 3
-	if len(a.history) > keep+1 {
-		a.history = append(
-			a.history[:1],
-			a.history[len(a.history)-keep:]...,
-		)
+
+	// totalTokens 不可信时用消息长度估算
+	if a.totalTokens <= 0 {
+		a.totalTokens = estimateTokens(a.history)
 	}
-	a.totalTokens = 0
+	beforeTokens := a.totalTokens
+
+	sysCount := 0
+	for sysCount < n && a.history[sysCount].Role == "system" {
+		sysCount++
+	}
+
+	cutIdx := n - compactKeep
+	if cutIdx <= sysCount {
+		cutIdx = sysCount
+	}
+
+	// 不截断 tool 配对
+	for cutIdx < n && a.history[cutIdx].Role == "tool" {
+		if cutIdx <= sysCount {
+			break
+		}
+		cutIdx--
+	}
+
+	summary := fmt.Sprintf(
+		"【上下文已压缩】之前的对话已截断（约 %s token）。"+
+			"如果当前任务依赖之前的上下文，请先回顾下方保留的最近消息；"+
+			"如有必要让用户重新描述需求。",
+		llm.FormatTokens(beforeTokens),
+	)
+
+	newHistory := make([]llm.Message, 0, sysCount+1+(n-cutIdx))
+	newHistory = append(newHistory, a.history[:sysCount]...)
+	newHistory = append(newHistory, llm.Message{Role: "system", Content: summary})
+	newHistory = append(newHistory, a.history[cutIdx:]...)
+	a.history = newHistory
+
+	a.totalTokens = estimateTokens(newHistory)
 	a.recentCmds = map[string]int{}
+	return true
+}
+
+// estimateTokens 用消息内容粗略估算 token 数（4 字符 ≈ 1 token）。
+func estimateTokens(msgs []llm.Message) int {
+	total := 0
+	for _, m := range msgs {
+		total += len(m.Content) / 4
+		for _, tc := range m.ToolCalls {
+			total += len(tc.Function.Arguments) / 4
+		}
+	}
+	if total < 1 {
+		total = 1
+	}
+	return total
 }
 
 // SwitchProvider 切换 LLM 提供商（DeepSeek ↔ Ollama）。
@@ -481,7 +536,13 @@ func (a *Agent) ProviderInfo() (name, baseURL, model, proModel string) {
 }
 
 // TokenCount 返回已使用的总 token 数。
-func (a *Agent) TokenCount() int { return a.totalTokens }
+// 如果计数器异常归零（历史遗留或 Compact 后未更新），回退到消息长度估算。
+func (a *Agent) TokenCount() int {
+	if a.totalTokens <= 0 && len(a.history) > 2 {
+		a.totalTokens = estimateTokens(a.history)
+	}
+	return a.totalTokens
+}
 
 // LastTasks 返回最近 n 条任务记录。
 func (a *Agent) LastTasks(n int) []TaskEntry {

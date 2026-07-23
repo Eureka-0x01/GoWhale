@@ -27,7 +27,9 @@ type Model struct {
 	approvalWarning string
 
 	// 输入
-	input textarea.Model
+	input        textarea.Model
+	showCommands bool // 是否显示 / 命令提示
+	commandIdx   int  // 当前选中的命令索引
 
 	// 运行时统计
 	lastCallCount int
@@ -35,11 +37,14 @@ type Model struct {
 	// 尺寸
 	width  int
 	height int
+
+	// 初始化后自动执行的任务（非空时触发）
+	initialTask string
 }
 
-func NewModel(ag *agent.Agent) *Model {
+func NewModel(ag *agent.Agent, initialTask string) *Model {
 	ta := textarea.New()
-	ta.Placeholder = "输入任务... / 开头查看命令"
+	ta.Placeholder = "输入任务...  / 查看命令  Tab 切换侧栏"
 	ta.ShowLineNumbers = false
 	ta.SetHeight(3)
 	ta.CharLimit = 0
@@ -49,13 +54,14 @@ func NewModel(ag *agent.Agent) *Model {
 	vp.Style = lipgloss.NewStyle().Padding(0, 1)
 
 	return &Model{
-		agent:     ag,
-		viewport:  vp,
-		StatusBar: NewStatusBar(ag),
-		Footer:    NewFooter(),
-		Sidebar:   NewSidebar(),
-		input:     ta,
-		width:     80,
-		height:    24,
+		agent:       ag,
+		viewport:    vp,
+		StatusBar:   NewStatusBar(ag),
+		Footer:      NewFooter(),
+		Sidebar:     NewSidebar(),
+		input:       ta,
+		width:       80,
+		height:      24,
+		initialTask: initialTask,
 	}
 }

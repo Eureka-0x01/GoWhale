@@ -59,7 +59,13 @@ func (m *Model) View() string {
 	// ── 输入区 ──
 	inputArea := m.input.View()
 
-	return header + "\n" + body + "\n" + divider + "\n" + footer + "\n" + inputArea
+	// ── / 命令提示 ──
+	var commandHints string
+	if m.showCommands {
+		commandHints = renderCommandHints(m.input.Value(), m.width, m.commandIdx)
+	}
+
+	return header + "\n" + body + "\n" + divider + "\n" + footer + "\n" + commandHints + inputArea
 }
 
 func (m *Model) columnWidth() int {
@@ -193,4 +199,63 @@ func formatTokens(n int) string {
 
 func formatTokensF(n int) string {
 	return formatTokens(n) + " token"
+}
+
+// ── / 命令提示渲染 ──
+
+// commandItem 命令条目。
+type commandItem struct {
+	name string
+	desc string
+}
+
+// availableCommands 所有可用的 / 命令。
+var availableCommands = []commandItem{
+	{"/help", "帮助信息"},
+	{"/model", "查看当前模型"},
+	{"/clear", "清空对话历史"},
+	{"/clear-key", "清除已保存的 API Key"},
+	{"/history", "查看最近对话记录"},
+	{"/compact", "压缩上下文节省 token"},
+	{"/ollama", "切换使用 Ollama 本地模型"},
+	{"/deepseek", "切换使用 DeepSeek 云端模型"},
+	{"/exit", "退出程序"},
+}
+
+// filterCommands 返回所有前缀匹配的命令名。
+func filterCommands(input string) []string {
+	input = strings.TrimSpace(input)
+	var matched []string
+	for _, c := range availableCommands {
+		if strings.HasPrefix(c.name, input) {
+			matched = append(matched, c.name)
+		}
+	}
+	return matched
+}
+
+// renderCommandHints 根据输入过滤并渲染命令提示，高亮 selectedIdx。
+func renderCommandHints(input string, width int, selectedIdx int) string {
+	matched := filterCommands(input)
+	if len(matched) == 0 {
+		return ""
+	}
+
+	var lines []string
+	for i, name := range matched {
+		desc := ""
+		for _, c := range availableCommands {
+			if c.name == name {
+				desc = c.desc
+				break
+			}
+		}
+		line := fmt.Sprintf("  %-14s %s", name, dim(desc))
+		if i == selectedIdx {
+			line = "\033[7m" + line + "\033[0m" // 反色高亮
+		}
+		lines = append(lines, line)
+	}
+
+	return strings.Join(lines, "\n") + "\n"
 }
