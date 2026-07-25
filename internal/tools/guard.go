@@ -43,7 +43,7 @@ var dangerousPatterns = []*regexp.Regexp{
 }
 
 // checkDanger 判断命令是否危险。返回命中的原因（空字符串表示安全）。
-func checkDanger(command string) string {
+func CheckDanger(command string) string {
 	c := strings.TrimSpace(command)
 	for _, re := range dangerousPatterns {
 		if re.MatchString(c) {

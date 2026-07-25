@@ -3,7 +3,6 @@ package ui
 import (
 	"fmt"
 	"strings"
-
 	"gowhale/internal/agent"
 )
 
@@ -39,7 +38,7 @@ func (m *Model) View() string {
 		}
 		chatAreaStyled := clipWidth(chatArea, chatW)
 		sidebarStyled := sidebarContent
-		body = lipglossJoinH(chatAreaStyled, "  ", sidebarStyled)
+		body = hjoin(chatAreaStyled, chatW, "  ", sidebarStyled)
 	} else {
 		body = chatArea
 	}
@@ -80,22 +79,22 @@ func (m *Model) renderMessages() string {
 	for _, ev := range m.messages {
 		switch ev.Type {
 		case agent.EventType(999):
-			sb.WriteString(boldC(color("12", "▸ "+ev.Message)) + "\n")
+			sb.WriteString(boldC(color("36", "▸ "+ev.Message)) + "\n")
 		case agent.EventDone:
-			sb.WriteString("\n" + color("10", ev.Message) + "\n")
+			sb.WriteString("\n" + color("32", ev.Message) + "\n")
 		case agent.EventToolCall:
 			icon := toolIcon(ev.ToolName)
 			label := fmt.Sprintf("[%d]", ev.Step)
-			sb.WriteString(color("11", fmt.Sprintf(" %s %s %s  %s",
+			sb.WriteString(color("36", fmt.Sprintf(" %s %s %s  %s",
 				label, icon, ev.ToolName, ev.ToolArgs)) + "\n")
 		case agent.EventToolResult:
 			if ev.IsError {
-				sb.WriteString(color("9", "    ✗ "+firstLine(ev.ToolResult)) + "\n")
+				sb.WriteString(color("31", "    ✗ "+firstLine(ev.ToolResult)) + "\n")
 			} else {
 				sb.WriteString(dim("    ✓ " + firstLine(ev.ToolResult)) + "\n")
 			}
 		case agent.EventError:
-			sb.WriteString(color("9", "✗ "+ev.Message) + "\n")
+			sb.WriteString(color("31", "✗ "+ev.Message) + "\n")
 		}
 	}
 	return sb.String()
@@ -108,7 +107,7 @@ func (m *Model) renderApproval() string {
 	}
 	return fmt.Sprintf(
 		"%s🔧 %s  %s\n%s   ▶ [y] 允许本次  [a] 始终允许  [n] 拒绝",
-		color("3", "════ 审批 ════\n"),
+		color("33", "════ 审批 ════\n"),
 		m.pendingApproval.ToolName,
 		m.pendingApproval.Arguments,
 		warning,
@@ -152,8 +151,76 @@ func clipWidth(s string, w int) string {
 	return strings.Join(lines, "\n")
 }
 
-func lipglossJoinH(left, sep, right string) string {
-	return left + sep + right
+// hjoin 将左右两个多行文本逐行水平拼接。
+// 左侧宽度固定为 leftW（字符数，不含 ANSI 转义码）。
+func hjoin(left string, leftW int, sep string, right string) string {
+	leftLines := strings.Split(left, "\n")
+	rightLines := strings.Split(right, "\n")
+
+	maxLines := len(leftLines)
+	if len(rightLines) > maxLines {
+		maxLines = len(rightLines)
+	}
+
+	// 统一行数
+	for len(leftLines) < maxLines {
+		leftLines = append(leftLines, "")
+	}
+	for len(rightLines) < maxLines {
+		rightLines = append(rightLines, "")
+	}
+
+	var sb strings.Builder
+	for i := 0; i < maxLines; i++ {
+		if i > 0 {
+			sb.WriteByte('\n')
+		}
+		leftVis := visualWidth(leftLines[i])
+		sb.WriteString(leftLines[i])
+		if leftVis < leftW {
+			sb.WriteString(strings.Repeat(" ", leftW-leftVis))
+		}
+		sb.WriteString(sep)
+		sb.WriteString(rightLines[i])
+	}
+	return sb.String()
+}
+
+// visualWidth 计算去掉 ANSI 转义码后的显示宽度。
+func visualWidth(s string) int {
+	clean := stripANSI(s)
+	w := 0
+	for _, r := range clean {
+		if r <= 0x7F {
+			w++
+		} else {
+			w += 2 // CJK 等宽字符按 2 列计算
+		}
+	}
+	return w
+}
+
+// stripANSI 快速移除 ANSI SGR 序列（\033[...m 形式）。
+func stripANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '\033' && i+1 < len(s) && s[i+1] == '[' {
+			// 跳过直到 'm'
+			j := i + 2
+			for j < len(s) && s[j] != 'm' {
+				j++
+			}
+			if j < len(s) {
+				i = j + 1 // 跳过 'm'
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }
 
 // ── 简易 ANSI 颜色 ──
@@ -199,63 +266,4 @@ func formatTokens(n int) string {
 
 func formatTokensF(n int) string {
 	return formatTokens(n) + " token"
-}
-
-// ── / 命令提示渲染 ──
-
-// commandItem 命令条目。
-type commandItem struct {
-	name string
-	desc string
-}
-
-// availableCommands 所有可用的 / 命令。
-var availableCommands = []commandItem{
-	{"/help", "帮助信息"},
-	{"/model", "查看当前模型"},
-	{"/clear", "清空对话历史"},
-	{"/clear-key", "清除已保存的 API Key"},
-	{"/history", "查看最近对话记录"},
-	{"/compact", "压缩上下文节省 token"},
-	{"/ollama", "切换使用 Ollama 本地模型"},
-	{"/deepseek", "切换使用 DeepSeek 云端模型"},
-	{"/exit", "退出程序"},
-}
-
-// filterCommands 返回所有前缀匹配的命令名。
-func filterCommands(input string) []string {
-	input = strings.TrimSpace(input)
-	var matched []string
-	for _, c := range availableCommands {
-		if strings.HasPrefix(c.name, input) {
-			matched = append(matched, c.name)
-		}
-	}
-	return matched
-}
-
-// renderCommandHints 根据输入过滤并渲染命令提示，高亮 selectedIdx。
-func renderCommandHints(input string, width int, selectedIdx int) string {
-	matched := filterCommands(input)
-	if len(matched) == 0 {
-		return ""
-	}
-
-	var lines []string
-	for i, name := range matched {
-		desc := ""
-		for _, c := range availableCommands {
-			if c.name == name {
-				desc = c.desc
-				break
-			}
-		}
-		line := fmt.Sprintf("  %-14s %s", name, dim(desc))
-		if i == selectedIdx {
-			line = "\033[7m" + line + "\033[0m" // 反色高亮
-		}
-		lines = append(lines, line)
-	}
-
-	return strings.Join(lines, "\n") + "\n"
 }

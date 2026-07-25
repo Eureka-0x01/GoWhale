@@ -10,7 +10,7 @@ import (
 
 // Model 是 Bubble Tea 的应用状态。
 type Model struct {
-	agent   *agent.Agent
+	agent   agent.AgentInterface
 	events  <-chan agent.Event
 
 	// 对话区
@@ -42,15 +42,16 @@ type Model struct {
 	initialTask string
 }
 
-func NewModel(ag *agent.Agent, initialTask string) *Model {
+func NewModel(ag agent.AgentInterface, initialTask string) *Model {
 	ta := textarea.New()
 	ta.Placeholder = "输入任务...  / 查看命令  Tab 切换侧栏"
 	ta.ShowLineNumbers = false
-	ta.SetHeight(3)
+	ta.SetHeight(5)
+	ta.SetWidth(120)
 	ta.CharLimit = 0
 	ta.Focus()
 
-	vp := viewport.New(80, 20)
+	vp := viewport.New(120, 20)
 	vp.Style = lipgloss.NewStyle().Padding(0, 1)
 
 	return &Model{
@@ -60,7 +61,7 @@ func NewModel(ag *agent.Agent, initialTask string) *Model {
 		Footer:      NewFooter(),
 		Sidebar:     NewSidebar(),
 		input:       ta,
-		width:       80,
+		width:       120,
 		height:      24,
 		initialTask: initialTask,
 	}

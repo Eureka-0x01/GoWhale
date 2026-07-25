@@ -11,10 +11,10 @@ import (
 
 // StatusBar 顶部状态栏。
 type StatusBar struct {
-	agent *agent.Agent
+	agent agent.AgentInterface
 }
 
-func NewStatusBar(ag *agent.Agent) StatusBar {
+func NewStatusBar(ag agent.AgentInterface) StatusBar {
 	return StatusBar{agent: ag}
 }
 

@@ -96,6 +96,14 @@ const skillRules = "" +
 	"- 审批被拒绝时解释原因、提供替代方案,不强行绕过。\n" +
 	"- 完成后用两句话总结做了什么，最后一行只写「执行完成」。注意：只说执行完成，不要再多说其他话。"
 
+// reflectPrompt 在连续工具调用失败时注入，要求模型暂停并分析根因。
+const reflectPrompt = "" +
+	"【反思提示】已连续多次工具调用返回错误。请暂停当前策略，逐条回答以下问题：\n" +
+	"1. 上述错误的根因是什么？（不要猜测，要基于错误信息分析）\n" +
+	"2. 当前策略是否方向错误？是否需要换一个完全不同的思路？\n" +
+	"3. 是否需要先用 list_dir 或 read_file 确认项目结构 / 文件内容？\n\n" +
+	"输出你的分析后，再给出下一轮的工具调用。"
+
 // New 创建 Agent。maxTurns 为单次请求内的最大工具调用轮数。
 func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTurns int, workspace string, fastModel, proModel string) *Agent {
 	if err := os.MkdirAll(workspace, 0o755); err == nil {
@@ -172,6 +180,8 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 	defs := a.registry.Definitions()
 	step := 0
 	callCount := 0
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 2
 
 	for turn := 0; turn < a.maxTurns; turn++ {
 		ch <- Event{Type: EventThinking, TokenCount: a.totalTokens}
@@ -195,9 +205,13 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 
 		// 无工具调用 → 任务完成
 		if len(msg.ToolCalls) == 0 {
-			a.debugLog.Done(msg.Content, a.totalTokens)
-			ch <- Event{Type: EventDone, Message: msg.Content, TokenCount: a.totalTokens}
-			a.journal.Note("✅ " + msg.Content)
+			finalMsg := msg.Content
+			if strings.TrimSpace(finalMsg) == "" {
+				finalMsg = "任务完成。"
+			}
+			a.debugLog.Done(finalMsg, a.totalTokens)
+			ch <- Event{Type: EventDone, Message: finalMsg, TokenCount: a.totalTokens}
+			a.journal.Note("✅ " + finalMsg)
 			return
 		}
 
@@ -272,6 +286,7 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 		}
 
 		// 执行工具调用
+		roundHadError := false
 		for _, tc := range msg.ToolCalls {
 			callCount++
 			step++
@@ -290,6 +305,9 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 
 			result := a.executeWithApproval(tc, ch)
 			isErr := strings.HasPrefix(result, "执行出错：")
+			if isErr {
+				roundHadError = true
+			}
 			a.debugLog.ToolResult(step, tc.Function.Name, result, isErr)
 			ch <- Event{
 				Type:       EventToolResult,
@@ -305,6 +323,20 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 				ToolCallID: tc.ID,
 				Content:    result,
 			})
+		}
+
+		// ── 失败触发反思：连续 2 轮有工具错误 → 注入反思提示 ──
+		if roundHadError {
+			consecutiveErrors++
+		} else {
+			consecutiveErrors = 0
+		}
+		if consecutiveErrors >= maxConsecutiveErrors {
+			a.history = append(a.history, llm.Message{
+				Role:    "system",
+				Content: reflectPrompt,
+			})
+			consecutiveErrors = 0
 		}
 	}
 	ch <- Event{Type: EventError, Message: fmt.Sprintf("达到最大轮数 %d，任务未完成", a.maxTurns), TokenCount: a.totalTokens}

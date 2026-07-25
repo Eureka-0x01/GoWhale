@@ -71,9 +71,10 @@ func (c *Client) SwitchTo(baseURL, apiKey, model, proModel string) {
 }
 
 type chatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Tools    []Tool    `json:"tools,omitempty"`
+	Model     string    `json:"model"`
+	Messages  []Message `json:"messages"`
+	Tools     []Tool    `json:"tools,omitempty"`
+	MaxTokens int       `json:"max_tokens,omitempty"`
 }
 
 type chatResponse struct {
@@ -85,9 +86,10 @@ type chatResponse struct {
 
 func (c *Client) Chat(messages []Message, tools []Tool) (Message, Usage, error) {
 	body, err := json.Marshal(chatRequest{
-		Model:    c.cfg.Model,
-		Messages: messages,
-		Tools:    tools,
+		Model:     c.cfg.Model,
+		Messages:  messages,
+		Tools:     tools,
+		MaxTokens: 8192,
 	})
 	if err != nil {
 		return Message{}, Usage{}, err

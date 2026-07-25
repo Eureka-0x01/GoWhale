@@ -34,7 +34,7 @@ func (ShellTool) Review(args json.RawMessage) Decision {
 	_ = json.Unmarshal(args, &p)
 	return Decision{
 		NeedApproval: true,
-		Danger:       checkDanger(p.Command),
+		Danger:       CheckDanger(p.Command),
 		ScopeKind:    "session",
 		Scope:        "shell",
 	}
