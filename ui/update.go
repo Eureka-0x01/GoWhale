@@ -59,6 +59,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.waitForEvent()
 
 	case tea.KeyMsg:
+		// Shift+Enter: 在输入框中插入换行（不提交）
+		if msg.Type == tea.KeyRunes && string(msg.Runes) == "\n" {
+			m.input.InsertString("\n")
+			// 更新命令提示状态
+			m.showCommands = strings.HasPrefix(strings.TrimSpace(m.input.Value()), "/")
+			if m.showCommands {
+				m.commandIdx = 0
+			}
+			return m, nil
+		}
+
 		if m.pendingApproval != nil {
 			switch msg.String() {
 			case "y":

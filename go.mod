@@ -67,3 +67,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	trpc.group/trpc-go/trpc-a2a-go v0.2.5 // indirect
 )
+
+replace github.com/charmbracelet/bubbletea => ./third_party/bubbletea

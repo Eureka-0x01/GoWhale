@@ -129,7 +129,7 @@ func runClassic(ag agent.AgentInterface, cfg config.Config) {
 
 	p := prompt.New(
 		func(input string) {
-			input = strings.TrimSpace(input)
+			input = strings.TrimRight(input, "\r\n ")
 			if input == "" {
 				return
 			}
@@ -163,6 +163,15 @@ func runClassic(ag agent.AgentInterface, cfg config.Config) {
 		prompt.OptionLivePrefix(func() (string, bool) { return "你 > ", true }),
 		prompt.OptionCompletionWordSeparator(" "),
 		prompt.OptionCompletionOnDown(),
+		// Shift+Enter (发送 \n / 0x0A) → 在输入中插入换行
+		prompt.OptionAddASCIICodeBind(
+			prompt.ASCIICodeBind{
+				ASCIICode: []byte{0x0a},
+				Fn: func(buf *prompt.Buffer) {
+					buf.InsertText("\n", false, true)
+				},
+			},
+		),
 	)
 	p.Run()
 }

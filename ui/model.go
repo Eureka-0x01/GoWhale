@@ -44,7 +44,7 @@ type Model struct {
 
 func NewModel(ag agent.AgentInterface, initialTask string) *Model {
 	ta := textarea.New()
-	ta.Placeholder = "输入任务...  / 查看命令  Tab 切换侧栏"
+	ta.Placeholder = "输入任务...  / 命令  Tab 侧栏  Shift+Enter 换行"
 	ta.ShowLineNumbers = false
 	ta.SetHeight(5)
 	ta.SetWidth(120)
