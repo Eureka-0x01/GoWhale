@@ -29,6 +29,7 @@ var slashCommands = []prompt.Suggest{
 	{Text: "/compact", Description: "压缩上下文节省 token"},
 	{Text: "/ollama", Description: "切换使用 Ollama 本地模型"},
 	{Text: "/deepseek", Description: "切换使用 DeepSeek 云端模型"},
+	{Text: "/chatroom", Description: "多角色协作（PM→Dev→QA→验收）"},
 	{Text: "/exit", Description: "退出程序"},
 }
 
@@ -58,13 +59,12 @@ func main() {
 	workspace, _ := os.Getwd()
 	tools.SetWorkspace(workspace)
 
-	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
-
 	// ── 有参数 ──
 	if len(os.Args) > 1 {
 		// --classic → 旧 go-prompt 交互模式
 		if os.Args[1] == "--classic" {
-			runClassic(ag, cfg)
+			ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
+			runClassic(ag, cfg, client, registry, approver, workspace)
 			return
 		}
 		// --tui [task] → TUI 模式（可选附带初始任务）
@@ -73,26 +73,39 @@ func main() {
 			if len(os.Args) > 2 {
 				task = strings.Join(os.Args[2:], " ")
 			}
+			ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
 			if err := ui.Run(ag, task); err != nil {
 				fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 				os.Exit(1)
 			}
 			return
 		}
-		// 一次性任务
-		ag.Run(strings.Join(os.Args[1:], " "))
+		// 一次性任务（自动检测是否需要多角色协作）
+		task := strings.Join(os.Args[1:], " ")
+		ag := selectAgent(task, client, cfg, registry, approver, workspace)
+		ag.Run(task)
 		return
 	}
 
 	// ── 无参数 → 默认 TUI 模式 ──
+	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
 	if err := ui.Run(ag, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 		os.Exit(1)
 	}
 }
 
+// selectAgent 根据任务复杂度选择 Agent 类型。
+func selectAgent(task string, client *llm.Client, cfg config.Config, registry *tools.Registry, approver *agent.Approver, workspace string) agent.AgentInterface {
+	if agent.ClassifyChatRoom(task, client) {
+		fmt.Println("🔀 检测到复杂任务，启用多角色协作模式（产品经理→程序员→测试→用户代理）")
+		return agent.NewChatRoom(client, registry, approver, workspace, cfg.Model, cfg.ProModel)
+	}
+	return agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
+}
+
 // runClassic 启动传统的 go-prompt 交互模式（通过 --classic 参数进入）。
-func runClassic(ag agent.AgentInterface, cfg config.Config) {
+func runClassic(ag agent.AgentInterface, cfg config.Config, client *llm.Client, registry *tools.Registry, approver *agent.Approver, workspace string) {
 	printBanner(cfg)
 	printHistory(ag)
 
@@ -104,7 +117,7 @@ func runClassic(ag agent.AgentInterface, cfg config.Config) {
 			}
 
 			if strings.HasPrefix(input, "/") {
-				exit := handleCommand(input, bufio.NewReader(os.Stdin), ag)
+				exit := handleCommand(input, bufio.NewReader(os.Stdin), ag, client, cfg, registry, approver, workspace)
 				if exit {
 					fmt.Println("再见！")
 					os.Exit(0)
@@ -192,7 +205,7 @@ func printBanner(cfg config.Config) {
 	fmt.Println()
 }
 
-func handleCommand(input string, in *bufio.Reader, ag agent.AgentInterface) bool {
+func handleCommand(input string, in *bufio.Reader, ag agent.AgentInterface, client *llm.Client, cfg config.Config, registry *tools.Registry, approver *agent.Approver, workspace string) bool {
 	cmd := strings.ToLower(strings.TrimSpace(input))
 	switch cmd {
 	case "/help":
@@ -233,6 +246,18 @@ func handleCommand(input string, in *bufio.Reader, ag agent.AgentInterface) bool
 			fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 		}
 
+	case "/chatroom":
+		fmt.Print("\n请输入任务（将使用多角色协作模式）：")
+		task, _ := in.ReadString('\n')
+		task = strings.TrimSpace(task)
+		if task == "" {
+			fmt.Println("已取消。")
+			break
+		}
+		fmt.Println("\n🔀 启动多角色协作（产品经理→程序员→测试→用户代理）...")
+		cr := agent.NewChatRoom(client, registry, approver, workspace, cfg.Model, cfg.ProModel)
+		cr.Run(task)
+
 	case "/ollama":
 		ollamaURL := os.Getenv("AICODE_OLLAMA_URL")
 		ollamaModel := os.Getenv("AICODE_OLLAMA_MODEL")
@@ -270,6 +295,7 @@ func printHistory(ag agent.AgentInterface) {
 		fmt.Println("    直接输入任务，如「检查项目」「创建一个 hello world」")
 		fmt.Println("    输入 / 查看所有命令")
 		fmt.Println("    输入 /tui 切换到 TUI 分栏模式")
+		fmt.Println("    输入 /chatroom 启用多角色协作模式")
 		fmt.Println()
 		fmt.Println("  提示：")
 		fmt.Println("    · 只读操作自动放行，写文件/执行命令需审批确认")
