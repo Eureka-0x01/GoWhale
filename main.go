@@ -40,15 +40,6 @@ func main() {
 
 	cfg := config.Load()
 
-	// 检测 --framework 参数
-	useFramework := false
-	for _, a := range os.Args {
-		if a == "--framework" {
-			useFramework = true
-			break
-		}
-	}
-
 	client := llm.NewClient(cfg)
 	registry := tools.New(
 		tools.WritePlanTool{},
@@ -67,42 +58,20 @@ func main() {
 	workspace, _ := os.Getwd()
 	tools.SetWorkspace(workspace)
 
-	var ag agent.AgentInterface
-	if useFramework {
-		ag = agent.NewFrameAgentFromWorkspace(cfg.BaseURL, cfg.APIKey, cfg.Model, registry, approver, workspace)
-	} else {
-		ag = agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
-	}
+	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
 
 	// ── 有参数 ──
 	if len(os.Args) > 1 {
-		// 过滤掉 --framework 标志
-		realArgs := make([]string, 0, len(os.Args)-1)
-		for _, a := range os.Args[1:] {
-			if a != "--framework" {
-				realArgs = append(realArgs, a)
-			}
-		}
-
-		if len(realArgs) == 0 {
-			// 只有 --framework，无任务 → 进入 TUI
-			if err := ui.Run(ag, ""); err != nil {
-				fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
-				os.Exit(1)
-			}
-			return
-		}
-
 		// --classic → 旧 go-prompt 交互模式
-		if realArgs[0] == "--classic" {
+		if os.Args[1] == "--classic" {
 			runClassic(ag, cfg)
 			return
 		}
 		// --tui [task] → TUI 模式（可选附带初始任务）
-		if realArgs[0] == "--tui" {
+		if os.Args[1] == "--tui" {
 			task := ""
-			if len(realArgs) > 1 {
-				task = strings.Join(realArgs[1:], " ")
+			if len(os.Args) > 2 {
+				task = strings.Join(os.Args[2:], " ")
 			}
 			if err := ui.Run(ag, task); err != nil {
 				fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
@@ -111,7 +80,7 @@ func main() {
 			return
 		}
 		// 一次性任务
-		ag.Run(strings.Join(realArgs, " "))
+		ag.Run(strings.Join(os.Args[1:], " "))
 		return
 	}
 
