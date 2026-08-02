@@ -4,25 +4,34 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
-// Sidebar 右侧边栏（可折叠、可切换面板）。
+// Sidebar 右侧边栏（tview 实现）。
 type Sidebar struct {
 	Visible bool
 	Active  string // Work / Tasks / Context
-	width   int
 
-	// 运行时数据（由 Model 在接收到事件时更新）
-	modelName    string
-	totalTokens  int
-	callCount    int
-	maxCalls     int
-	recentSteps  []SidebarStep
-	recentTasks  []string // 最近任务摘要（来自 journal）
+	flex     *tview.Flex
+	pages    *tview.Pages
+	tabViews map[string]*tview.TextView // 标签 TextView，用于样式切换
+
+	workView    *tview.TextView
+	tasksView   *tview.TextView
+	contextView *tview.TextView
+
+	// 运行时数据
+	modelName   string
+	totalTokens int
+	callCount   int
+	maxCalls    int
+	recentSteps []SidebarStep
+	recentTasks []string
+	chatRole    string
+	chatRound   int
 }
 
-// SidebarStep 侧边栏任务步骤条目。
 type SidebarStep struct {
 	Step    int
 	Tool    string
@@ -30,43 +39,40 @@ type SidebarStep struct {
 	Summary string
 }
 
-// ── 样式 ──
-
-var (
-	sidebarStyle = lipgloss.NewStyle().
-			Width(24).
-			Padding(0, 1)
-
-	panelHeader = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("12")).
-			Bold(true)
-
-	panelTitle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("14")).
-			Bold(true)
-
-	tabActive = lipgloss.NewStyle().
-			Background(lipgloss.Color("4")).
-			Foreground(lipgloss.Color("15")).
-			Padding(0, 1)
-
-	tabInactive = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("8")).
-			Padding(0, 1)
-
-	stepPending = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	stepOK      = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	stepErr     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-)
-
-// ── 构造 ──
-
-func NewSidebar() Sidebar {
-	return Sidebar{
-		Visible: true,
-		Active:  "Work",
-		width:   24,
+func NewSidebar() *Sidebar {
+	s := &Sidebar{
+		Visible:  true,
+		Active:   "Work",
+		tabViews: map[string]*tview.TextView{},
 	}
+
+	s.workView = tview.NewTextView().SetDynamicColors(true)
+	s.workView.SetBorder(true).SetTitle(" 任务步骤 ").SetBorderColor(Theme.SidebarBorder)
+
+	s.tasksView = tview.NewTextView().SetDynamicColors(true)
+	s.tasksView.SetBorder(true).SetTitle(" 最近任务 ").SetBorderColor(Theme.SidebarBorder)
+
+	s.contextView = tview.NewTextView().SetDynamicColors(true)
+	s.contextView.SetBorder(true).SetTitle(" 上下文 ").SetBorderColor(Theme.SidebarBorder)
+
+	s.pages = tview.NewPages().
+		AddPage("Work", s.workView, true, true).
+		AddPage("Tasks", s.tasksView, true, false).
+		AddPage("Context", s.contextView, true, false)
+
+	tabBar := s.buildTabBar()
+
+	s.flex = tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(tabBar, 1, 0, false).
+		AddItem(s.pages, 0, 1, true)
+
+	s.renderContext()
+	return s
+}
+
+func (s *Sidebar) Flex() *tview.Flex {
+	return s.flex
 }
 
 func (s *Sidebar) Toggle()  { s.Visible = !s.Visible }
@@ -79,189 +85,191 @@ func (s *Sidebar) CycleMode() {
 	default:
 		s.Active = "Work"
 	}
+	s.switchTab()
+}
+
+// buildTabBar 创建标签栏并缓存 tabViews。
+func (s *Sidebar) buildTabBar() *tview.Flex {
+	flex := tview.NewFlex().SetDirection(tview.FlexColumn)
+	for _, name := range []string{"Work", "Tasks", "Context"} {
+		tv := s.makeTab(name)
+		s.tabViews[name] = tv
+		flex.AddItem(tv, 0, 1, false)
+	}
+	return flex
+}
+
+// makeTab 创建单个标签 TextView。
+func (s *Sidebar) makeTab(name string) *tview.TextView {
+	tv := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter)
+	fmt.Fprint(tv, " "+name+" ")
+
+	tv.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
+		if action == tview.MouseLeftClick {
+			s.Active = name
+			s.switchTab()
+		}
+		return action, event
+	})
+	return tv
+}
+
+func (s *Sidebar) applyTabStyle(tv *tview.TextView, name string) {
+	if name == s.Active {
+		tv.SetBackgroundColor(Theme.TabActiveBg)
+		tv.SetTextColor(Theme.TabActiveFg)
+	} else {
+		tv.SetBackgroundColor(Theme.TabInactiveBg)
+		tv.SetTextColor(Theme.TabInactiveFg)
+	}
+}
+
+// switchTab 切换面板并原地更新标签样式（不再重建 widget）。
+func (s *Sidebar) switchTab() {
+	s.pages.SwitchToPage(s.Active)
+	for name, tv := range s.tabViews {
+		s.applyTabStyle(tv, name)
+	}
+}
+
+// ── 数据更新 ──
+
+func (s *Sidebar) SetModel(name string, tokens int) {
+	s.modelName = name
+	s.totalTokens = tokens
+	s.renderContext()
+}
+
+func (s *Sidebar) SetBudget(calls, maxCalls int) {
+	s.callCount = calls
+	s.maxCalls = maxCalls
+	s.renderContext()
+}
+
+func (s *Sidebar) SetTasks(tasks []string) {
+	s.recentTasks = tasks
+	s.renderTasks()
+}
+
+func (s *Sidebar) SetChatRole(role string, round int) {
+	s.chatRole = role
+	s.chatRound = round
+}
+
+func (s *Sidebar) AddStep(step int, tool, status, summary string) {
+	s.recentSteps = append(s.recentSteps, SidebarStep{step, tool, status, summary})
+	if len(s.recentSteps) > 20 {
+		s.recentSteps = s.recentSteps[len(s.recentSteps)-20:]
+	}
+	s.renderWork()
 }
 
 // ── 渲染 ──
 
-func (s *Sidebar) View() string {
-	if !s.Visible {
-		return ""
-	}
+func (s *Sidebar) renderWork() {
+	s.workView.Clear()
 
-	// 顶部标签栏
-	tabs := s.renderTabs()
-	divider := strings.Repeat("─", s.width)
-
-	var content string
-	switch s.Active {
-	case "Work":
-		content = s.renderWork()
-	case "Tasks":
-		content = s.renderTasks()
-	case "Context":
-		content = s.renderContext()
-	}
-
-	return sidebarStyle.Render(tabs + "\n" + divider + "\n" + content)
-}
-
-func (s *Sidebar) renderTabs() string {
-	tabs := []string{"Work", "Tasks", "Context"}
-	var parts []string
-	for _, t := range tabs {
-		if t == s.Active {
-			parts = append(parts, tabActive.Render(t))
-		} else {
-			parts = append(parts, tabInactive.Render(t))
+	if s.chatRole != "" {
+		roleIcons := map[string]string{
+			"pm": "🧑‍💼", "dev": "👨‍💻", "qa": "🔬", "user_proxy": "👤",
 		}
+		roleLabels := map[string]string{
+			"pm": "产品经理", "dev": "程序员", "qa": "测试", "user_proxy": "用户代理",
+		}
+		icon := roleIcons[s.chatRole]
+		if icon == "" {
+			icon = "🔀"
+		}
+		label := roleLabels[s.chatRole]
+		if label == "" {
+			label = s.chatRole
+		}
+		roundInfo := ""
+		if s.chatRound > 0 {
+			roundInfo = fmt.Sprintf(" (第%d轮)", s.chatRound)
+		}
+		fmt.Fprintf(s.workView, "[%s]%s %s%s\n\n[white]", Theme.HighLight, icon, label, roundInfo)
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
-}
-
-// Work 面板：当前任务的步骤进度。
-func (s *Sidebar) renderWork() string {
-	var sb strings.Builder
-
-	// 标题
-	sb.WriteString(panelTitle.Render("📋 任务步骤"))
-	sb.WriteString("\n")
 
 	if len(s.recentSteps) == 0 {
-		sb.WriteString(dim("(等待任务开始)\n"))
-		return sb.String()
+		fmt.Fprintf(s.workView, "[%s](等待任务开始)[white]\n", Theme.Dim)
+		return
 	}
 
-	// 显示最近 12 个步骤
 	start := 0
 	if len(s.recentSteps) > 12 {
 		start = len(s.recentSteps) - 12
 	}
 	for _, st := range s.recentSteps[start:] {
 		icon := "○"
-		style := stepPending
+		color := Theme.Dim
 		switch st.Status {
 		case "ok":
 			icon = "✓"
-			style = stepOK
+			color = Theme.TaskDone
 		case "err":
 			icon = "✗"
-			style = stepErr
+			color = Theme.TaskErr
 		}
-		label := fmt.Sprintf("[%d]", st.Step)
-		if len(label) < 4 {
-			label += strings.Repeat(" ", 4-len(label))
-		}
-		sb.WriteString(style.Render(fmt.Sprintf(" %s %s %s", icon, label, st.Tool)))
-		sb.WriteString("\n")
+		fmt.Fprintf(s.workView, "[%s] %s [%d] %s[white]\n", color, icon, st.Step, st.Tool)
 		if st.Summary != "" && len(st.Summary) < 30 {
-			sb.WriteString(dim(fmt.Sprintf("     %s\n", st.Summary)))
+			fmt.Fprintf(s.workView, "[%s]     %s[white]\n", Theme.Dim, escapeTags(st.Summary))
 		}
 	}
 
-	// 进度条
 	done := 0
 	for _, st := range s.recentSteps {
 		if st.Status == "ok" {
 			done++
 		}
 	}
-	sb.WriteString(fmt.Sprintf("\n  进度: %d/%d 步", done, s.callCount))
-	return sb.String()
+	total := len(s.recentSteps)
+	if total > 0 {
+		bar := strings.Repeat("█", done) + strings.Repeat("░", total-done)
+		fmt.Fprintf(s.workView, "\n[%s]%s %d/%d[white]", Theme.Dim, bar, done, total)
+	}
 }
 
-// Tasks 面板：最近的对话任务。
-func (s *Sidebar) renderTasks() string {
-	var sb strings.Builder
-	sb.WriteString(panelTitle.Render("📝 最近任务"))
-	sb.WriteString("\n")
-
+func (s *Sidebar) renderTasks() {
+	s.tasksView.Clear()
 	if len(s.recentTasks) == 0 {
-		sb.WriteString(dim("(暂无记录)\n"))
-		return sb.String()
+		fmt.Fprintf(s.tasksView, "[%s](无最近任务)[white]\n", Theme.Dim)
+		return
 	}
-
 	for _, t := range s.recentTasks {
-		if len(t) > 22 {
-			t = t[:22] + "…"
+		line := t
+		if len(line) > 35 {
+			line = line[:32] + "..."
 		}
-		sb.WriteString(dim(fmt.Sprintf("  • %s\n", t)))
+		fmt.Fprintf(s.tasksView, "[%s]•[white] %s\n", Theme.Dim, escapeTags(line))
 	}
-	return sb.String()
 }
 
-// Context 面板：会话上下文信息。
-func (s *Sidebar) renderContext() string {
-	var sb strings.Builder
-	sb.WriteString(panelTitle.Render("💡 上下文"))
-	sb.WriteString("\n\n")
+func (s *Sidebar) renderContext() {
+	s.contextView.Clear()
+	fmt.Fprintf(s.contextView, "[%s]模型:[white]  %s\n", Theme.HighLight, s.modelName)
+	fmt.Fprintf(s.contextView, "[%s]Token:[white] %s\n", Theme.HighLight, formatTokens(s.totalTokens))
 
-	info := []struct {
-		label string
-		value string
-	}{
-		{"模型", s.modelName},
-		{"Token", formatTokens(s.totalTokens)},
-		{"调用", fmt.Sprintf("%d/%d", s.callCount, s.maxCalls)},
-	}
-
-	for _, item := range info {
-		sb.WriteString(dim(item.label + ":"))
-		sb.WriteString("\n  ")
-		sb.WriteString(item.value)
-		sb.WriteString("\n\n")
-	}
-
-	// 用量条
-	usage := 0.0
+	usage := 0
 	if s.maxCalls > 0 {
-		usage = float64(s.callCount) / float64(s.maxCalls) * 100
+		usage = s.callCount * 100 / s.maxCalls
+		if usage > 100 {
+			usage = 100
+		}
 	}
-	bar := makeProgressBar(int(usage), 18)
-	sb.WriteString(dim("工具预算:\n"))
-	sb.WriteString(fmt.Sprintf("  %s %.0f%%\n", bar, usage))
-
-	return sb.String()
-}
-
-func makeProgressBar(pct, width int) string {
-	if pct > 100 {
-		pct = 100
+	barW := 16
+	filled := usage * barW / 100
+	empty := barW - filled
+	barColor := Theme.TaskDone
+	if usage > 80 {
+		barColor = Theme.TaskErr
+	} else if usage > 50 {
+		barColor = Theme.RoleChg
 	}
-	filled := pct * width / 100
-	empty := width - filled
-	bar := strings.Repeat("█", filled) + strings.Repeat("░", empty)
-	if pct > 80 {
-		bar = "\033[31m" + bar + "\033[0m" // 红色警告
-	} else if pct > 50 {
-		bar = "\033[33m" + bar + "\033[0m" // 黄色
-	}
-	return bar
-}
-
-// ── 数据更新方法（由 Model.updateSidebar 调用）──
-
-func (s *Sidebar) SetModel(name string, tokens int) {
-	s.modelName = name
-	s.totalTokens = tokens
-}
-
-func (s *Sidebar) SetBudget(used, max int) {
-	s.callCount = used
-	s.maxCalls = max
-}
-
-func (s *Sidebar) AddStep(step int, tool, status, summary string) {
-	s.recentSteps = append(s.recentSteps, SidebarStep{
-		Step:    step,
-		Tool:    tool,
-		Status:  status,
-		Summary: summary,
-	})
-	if len(s.recentSteps) > 50 {
-		s.recentSteps = s.recentSteps[len(s.recentSteps)-50:]
-	}
-}
-
-func (s *Sidebar) SetTasks(tasks []string) {
-	s.recentTasks = tasks
+	fmt.Fprintf(s.contextView, "[%s]调用:[white]  [%s]%s%s[white] %d/%d (%d%%)",
+		Theme.HighLight,
+		barColor, strings.Repeat("█", filled), strings.Repeat("░", empty),
+		s.callCount, s.maxCalls, usage)
 }

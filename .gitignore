@@ -20,3 +20,4 @@ rebuild.bat
 # 测试
 test_output/
 trim.txt
+gowhale_debug.log 
