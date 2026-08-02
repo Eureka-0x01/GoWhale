@@ -11,6 +11,7 @@ const (
 	EventDone                            // 任务完成
 	EventError                           // 致命错误
 	EventApprovalRequest                 // 需要用户审批
+	EventRoleChange                      // 多角色协作：角色切换
 )
 
 // Event 是 Agent 与外部通信的统一消息体。
@@ -25,6 +26,7 @@ type Event struct {
 	Step       int    // 当前步数
 	CallCount  int    // 累计调用次数
 	TokenCount int    // 累计 token
+	Role       string // 多角色协作：当前角色（pm/dev/qa/user_proxy），普通 Agent 为空
 
 	// 审批专用（EventApprovalRequest 时填充）
 	ApprovalRequest *ApprovalRequest
