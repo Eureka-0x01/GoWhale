@@ -28,7 +28,8 @@ type Model struct {
 	statusBar *tview.TextView
 	chatView  *tview.TextView
 	sidebar   *Sidebar
-	input     *tview.InputField
+	input     *tview.TextArea
+	hintBar   *tview.TextView
 	footer    *tview.TextView
 	mainFlex  *tview.Flex
 
@@ -48,6 +49,10 @@ type Model struct {
 	// 输入历史
 	inputHistory []string
 	historyIdx   int
+
+	// Tab 补全
+	completionIdx int
+	lastHintText string
 
 	// 消息缓冲
 	msgBuf     strings.Builder
@@ -73,6 +78,7 @@ func (m *Model) Build() *tview.Application {
 	m.buildChatView()
 	m.buildSidebar()
 	m.buildInput()
+	m.buildHintBar()
 	m.buildFooter()
 	m.buildLayout()
 	m.setupGlobalKeys()
@@ -133,21 +139,25 @@ func (m *Model) buildSidebar() {
 }
 
 func (m *Model) buildInput() {
-	m.input = tview.NewInputField().
-		SetPlaceholder("输入任务...  输入 / 后按 Tab 补全命令").
-		SetFieldWidth(0).
-		SetAutocompleteFunc(m.autocompleteCommands)
-	m.input.SetBorder(true).SetTitle(" 输入 ").SetBorderColor(Theme.ChatBorder)
+	m.input = tview.NewTextArea().
+		SetText("", false)
+	m.input.SetBorder(true).SetTitle(" 输入（Enter 发送，Shift+Enter 换行）").SetBorderColor(Theme.ChatBorder)
 
-
-
-	m.input.SetDoneFunc(func(key tcell.Key) {
-		if key == tcell.KeyEnter {
+	m.input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		// Shift+Enter → 换行（放行给 TextArea 自然处理）
+		if event.Key() == tcell.KeyEnter && event.Modifiers()&tcell.ModShift != 0 {
+			return event
+		}
+		// Enter → 提交
+		if event.Key() == tcell.KeyEnter {
+			m.completionIdx = -1
+			m.lastHintText = ""
+			m.hintBar.Clear()
 			text := strings.TrimSpace(m.input.GetText())
 			if text == "" {
-				return
+				return nil
 			}
-			m.input.SetText("")
+			m.input.SetText("", false)
 
 			// 记录历史
 			m.inputHistory = append(m.inputHistory, text)
@@ -157,33 +167,32 @@ func (m *Model) buildInput() {
 			m.historyIdx = len(m.inputHistory)
 
 			m.chatCh <- text
+			return nil
 		}
-	})
-
-	m.input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyUp:
 			if len(m.inputHistory) > 0 && m.historyIdx > 0 {
 				m.historyIdx--
-				m.input.SetText(m.inputHistory[m.historyIdx])
+				m.input.SetText(m.inputHistory[m.historyIdx], false)
 			}
 			return nil
 		case tcell.KeyDown:
 			if m.historyIdx < len(m.inputHistory)-1 {
 				m.historyIdx++
-				m.input.SetText(m.inputHistory[m.historyIdx])
+				m.input.SetText(m.inputHistory[m.historyIdx], false)
 			} else if m.historyIdx == len(m.inputHistory)-1 {
 				m.historyIdx = len(m.inputHistory)
-				m.input.SetText("")
+				m.input.SetText("", false)
 			}
 			return nil
 		case tcell.KeyTab:
-			// 输入 / 命令时，Tab 触发补全下拉；其他时候切换侧边栏
-			if strings.HasPrefix(m.input.GetText(), "/") {
-				return event // 放行给 InputField 的 autocomplete
+			currentText := m.input.GetText()
+			if len(currentText) >= 1 {
+				m.doCommandCompletion(currentText)
+			} else {
+				m.sidebar.Toggle()
+				m.adjustSidebarWidth()
 			}
-			m.sidebar.Toggle()
-			m.adjustSidebarWidth()
 			return nil
 		case tcell.KeyCtrlW:
 			m.sidebar.CycleMode()
@@ -191,6 +200,14 @@ func (m *Model) buildInput() {
 		}
 		return event
 	})
+}
+
+func (m *Model) buildHintBar() {
+	m.hintBar = tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft)
+	m.hintBar.SetBackgroundColor(Theme.HintBg)
+	m.hintBar.SetBorder(true).SetBorderColor(Theme.ChatBorder)
 }
 
 func (m *Model) buildFooter() {
@@ -210,7 +227,8 @@ func (m *Model) buildLayout() {
 		SetDirection(tview.FlexRow).
 		AddItem(m.statusBar, 1, 0, false).
 		AddItem(m.mainFlex, 0, 1, true).
-		AddItem(m.input, 3, 0, true).
+		AddItem(m.hintBar, 3, 0, false).
+		AddItem(m.input, 7, 0, true).
 		AddItem(m.footer, 1, 0, false)
 
 	m.adjustSidebarWidth()
@@ -306,6 +324,19 @@ func (m *Model) eventLoop() {
 
 		case <-ticker.C:
 			flush()
+			// 轮询检测输入变化，更新命令提示
+			m.app.QueueUpdateDraw(func() {
+				text := m.input.GetText()
+				if text != m.lastHintText {
+					m.lastHintText = text
+					m.completionIdx = -1
+					if len(text) >= 1 {
+						m.updateHintBar(text)
+					} else {
+						m.hintBar.Clear()
+					}
+				}
+			})
 		}
 	}
 }
@@ -462,14 +493,84 @@ var commandList = []struct {
 }
 
 func (m *Model) autocompleteCommands(currentText string) (entries []string) {
-	if strings.HasPrefix(currentText, "/") {
-		for _, c := range commandList {
-			if strings.HasPrefix(c.Name, currentText) {
-				entries = append(entries, c.Name)
-			}
+	// 如果用户没输入 /，自动补上再匹配（如 "elp" 也能匹配 "/help"）
+	pattern := currentText
+	if !strings.HasPrefix(currentText, "/") {
+		pattern = "/" + currentText
+	}
+	for _, c := range commandList {
+		if fuzzyMatch(c.Name, pattern) {
+			entries = append(entries, c.Name)
 		}
 	}
 	return
+}
+
+// fuzzyMatch 检查 pattern 是否按字符顺序出现在 target 中（模糊匹配）。
+func fuzzyMatch(target, pattern string) bool {
+	if pattern == "" {
+		return false
+	}
+	ti := 0
+	for pi := 0; pi < len(pattern); pi++ {
+		found := false
+		for ti < len(target) {
+			if target[ti] == pattern[pi] {
+				ti++
+				found = true
+				break
+			}
+			ti++
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// doCommandCompletion 执行 / 命令的 Tab 补全。
+// 唯一匹配 → 直接补全；多个匹配 → 先补公共前缀，再循环选择。
+func (m *Model) doCommandCompletion(currentText string) {
+	matches := m.autocompleteCommands(currentText)
+	if len(matches) == 0 {
+		return
+	}
+	if len(matches) == 1 {
+		m.input.SetText(matches[0], false)
+		m.completionIdx = -1
+		return
+	}
+	// 补全到公共前缀
+	prefix := commonPrefix(matches)
+	if len(prefix) > len(currentText) {
+		m.input.SetText(prefix, false)
+		m.completionIdx = -1
+		return
+	}
+	// 已在公共前缀，循环切换匹配项
+	m.completionIdx++
+	if m.completionIdx >= len(matches) {
+		m.completionIdx = 0
+	}
+	m.input.SetText(matches[m.completionIdx], false)
+}
+
+// commonPrefix 返回字符串切片的最长公共前缀。
+func commonPrefix(ss []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	prefix := ss[0]
+	for _, s := range ss[1:] {
+		for !strings.HasPrefix(s, prefix) {
+			prefix = prefix[:len(prefix)-1]
+			if prefix == "" {
+				return ""
+			}
+		}
+	}
+	return prefix
 }
 
 func (m *Model) handleCommand(cmd string) {
@@ -536,6 +637,27 @@ func (m *Model) handleCommand(cmd string) {
 	}
 }
 
+func (m *Model) updateHintBar(prefix string) {
+	matches := m.autocompleteCommands(prefix)
+	if len(matches) == 0 {
+		m.hintBar.Clear()
+		return
+	}
+	// 构建提示行：命令  说明，用 │ 分隔
+	var parts []string
+	for _, name := range matches {
+		for _, c := range commandList {
+			if c.Name == name {
+				parts = append(parts, fmt.Sprintf("%s  %s", name, c.Desc))
+				break
+			}
+		}
+	}
+	line := strings.Join(parts, "  │  ")
+	m.hintBar.Clear()
+	fmt.Fprintf(m.hintBar, "[%s]%s", Theme.Dim, line)
+}
+
 // ── Footer 辅助 ──
 
 func (m *Model) setFooterIdle() {
@@ -562,7 +684,7 @@ func (m *Model) refreshStatusBar() {
 	model := m.agent.ModelName()
 	tokens := m.agent.TokenCount()
 	m.statusBar.Clear()
-	left := fmt.Sprintf(" GoWhale  %s  │  %s token", model, formatTokens(tokens))
+	left := fmt.Sprintf(" GoWhale v0.2  %s  │  %s token", model, formatTokens(tokens))
 	if m.chatRole != "" {
 		label := roleLabel(m.chatRole)
 		if label != "" {

@@ -17,6 +17,7 @@ var Theme = struct {
 	StatusBarFg   tcell.Color
 	FooterBg      tcell.Color
 	FooterFg      tcell.Color
+	HintBg        tcell.Color
 	FooterHintFg  tcell.Color
 	ChatBorder    tcell.Color
 	SidebarBorder tcell.Color
@@ -42,6 +43,7 @@ var Theme = struct {
 	StatusBarFg:   tcell.ColorWhite,
 	FooterBg:      tcell.ColorDarkSlateGray,
 	FooterFg:      tcell.ColorWhite,
+	HintBg:        tcell.ColorDarkSlateGray,
 	FooterHintFg:  tcell.ColorDarkGray,
 	ChatBorder:    tcell.ColorDarkCyan,
 	SidebarBorder: tcell.ColorDarkCyan,
