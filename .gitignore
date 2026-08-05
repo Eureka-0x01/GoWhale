@@ -20,4 +20,14 @@ rebuild.bat
 # 测试
 test_output/
 trim.txt
-gowhale_debug.log 
+gowhale_debug.log
+
+# Python 工具脚本
+Python/
+fix_bat.py
+
+# 测试文件
+tests/
+
+# 会话导出
+session_*.json 
