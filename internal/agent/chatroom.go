@@ -91,6 +91,12 @@ func (cr *ChatRoom) ProviderInfo() (name, baseURL, model, proModel string) {
 	return
 }
 
+func (cr *ChatRoom) Messages() []llm.Message {
+	cp := make([]llm.Message, len(cr.sharedHistory))
+	copy(cp, cr.sharedHistory)
+	return cp
+}
+
 func (cr *ChatRoom) Compact() bool { return false }
 
 func (cr *ChatRoom) SwitchProvider(baseURL, apiKey, model, proModel string) {

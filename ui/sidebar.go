@@ -26,6 +26,7 @@ type Sidebar struct {
 	totalTokens int
 	callCount   int
 	maxCalls    int
+	msgCount    int // 消息条数
 	recentSteps []SidebarStep
 	recentTasks []string
 	chatRole    string
@@ -139,6 +140,11 @@ func (s *Sidebar) switchTab() {
 func (s *Sidebar) SetModel(name string, tokens int) {
 	s.modelName = name
 	s.totalTokens = tokens
+	s.renderContext()
+}
+
+func (s *Sidebar) SetMsgCount(count int) {
+	s.msgCount = count
 	s.renderContext()
 }
 

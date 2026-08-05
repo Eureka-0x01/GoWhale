@@ -465,6 +465,7 @@ func (m *Model) applyEvent(ev agent.Event) {
 		}
 		m.sidebar.AddStep(ev.Step, ev.ToolName, status, firstLine(ev.ToolResult))
 		m.sidebar.SetModel(m.agent.ModelName(), m.agent.TokenCount())
+		m.sidebar.SetMsgCount(len(m.agent.Messages()))
 		m.sidebar.SetBudget(m.lastCallCount, 40)
 	}
 

@@ -1,5 +1,7 @@
 package agent
 
+import "gowhale/internal/llm"
+
 // AgentInterface 定义 Agent 的公共接口。
 // 旧 Agent 和 FrameAgent 都实现此接口，使 TUI 无需关心底层实现。
 type AgentInterface interface {
@@ -28,6 +30,9 @@ type AgentInterface interface {
 
 	// Compact 压缩上下文，返回是否实际执行了截断。
 	Compact() bool
+
+	// Messages 返回当前消息历史副本。
+	Messages() []llm.Message
 
 	// SwitchProvider 切换 LLM 提供商。
 	SwitchProvider(baseURL, apiKey, model, proModel string)
