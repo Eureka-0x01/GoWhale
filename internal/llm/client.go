@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -129,9 +130,109 @@ func (c *Client) Chat(messages []Message, tools []Tool) (Message, Usage, error) 
 	if parsed.Usage != nil {
 		usage = *parsed.Usage
 	}
-	return parsed.Choices[0].Message, usage, nil
+	msg := parsed.Choices[0].Message
+
+	// 某些 Ollama 模型（如 qwen3-coder）返回 XML 格式的 tool_call，
+	// 而不是标准 JSON tool_calls。在此兼容解析。
+	if len(msg.ToolCalls) == 0 && strings.Contains(msg.Content, "</tool_call>") {
+		msg.ToolCalls = ParseXMLToolCalls(msg.Content)
+	}
+
+	return msg, usage, nil
 }
 
+// parseXMLToolCalls 从 XML 格式的 tool_call 块中提取 ToolCall 列表。
+// Ollama 的 qwen3-coder 等模型可能返回如下格式：
+//
+//	<tool_call>
+//	{"name": "read_file", "arguments": {"path": "main.go"}}
+//	</tool_call>
+func ParseXMLToolCalls(content string) []ToolCall {
+	var calls []ToolCall
+
+	// 格式 1: <tool_call>{"name": "xxx", "arguments": {...}}</tool_call>
+	re1 := regexp.MustCompile(`<tool_call>\s*\n?(.*?)\n?\s*</tool_call>`)
+	for i, m := range re1.FindAllStringSubmatch(content, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		if c := parseToolCallJSON(strings.TrimSpace(m[1]), i); c != nil {
+			calls = append(calls, *c)
+		}
+	}
+
+	// 格式 2: <function=NAME> <parameter=KEY> VAL </parameter> </function>
+	// qwen3-coder 常见非标准输出
+	if len(calls) > 0 {
+		return calls // 格式 1 成功就不再尝试格式 2
+	}
+	re2 := regexp.MustCompile(`<function=(\w+)>(.*?)</function>`)
+	for i, m := range re2.FindAllStringSubmatch(content, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		name := m[1]
+		params := m[2]
+		args := parseFunctionParams(params)
+		calls = append(calls, ToolCall{
+			ID:   fmt.Sprintf("xml_%d", i),
+			Type: "function",
+			Function: FunctionCall{
+				Name:      name,
+				Arguments: args,
+			},
+		})
+	}
+	return calls
+}
+
+// parseToolCallJSON 解析 tool_call 内的 JSON，返回 ToolCall。
+func parseToolCallJSON(jsonStr string, idx int) *ToolCall {
+	var tc struct {
+		Name      string         `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &tc); err != nil {
+		return nil
+	}
+	return &ToolCall{
+		ID:   fmt.Sprintf("xml_%d", idx),
+		Type: "function",
+		Function: FunctionCall{
+			Name:      tc.Name,
+			Arguments: string(tc.Arguments),
+		},
+	}
+}
+
+// parseFunctionParams 解析 qwen 风格 <parameter=KEY> VAL </parameter>，返回 JSON 参数字符串。
+func parseFunctionParams(params string) string {
+	re := regexp.MustCompile(`<parameter=(\w+)>\s*(.*?)\s*</parameter>`)
+	matches := re.FindAllStringSubmatch(params, -1)
+	if len(matches) == 0 {
+		return "{}"
+	}
+	// 构建 JSON 对象
+	parts := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if len(m) < 3 {
+			continue
+		}
+		key := m[1]
+		val := strings.TrimSpace(m[2])
+		// 如果值不是以 [ 或 { 开头，包裹为字符串；否则保持 JSON 原样
+		if val == "" {
+			val = "\"\""
+		} else if val[0] != '{' && val[0] != '[' && val[0] != '"' && val != "true" && val != "false" && val != "null" {
+			// 尝试作为数字，否则作为字符串
+			if _, err := fmt.Sscanf(val, "%f", new(float64)); err != nil {
+				val = fmt.Sprintf("%q", val)
+			}
+		}
+		parts = append(parts, fmt.Sprintf("%q:%s", key, val))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
 func FormatTokens(n int) string {
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)

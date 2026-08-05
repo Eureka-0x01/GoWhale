@@ -10,6 +10,8 @@ import (
 
 	"gowhale/internal/agent"
 	"gowhale/internal/config"
+	"gowhale/internal/llm"
+	"gowhale/internal/tools"
 )
 
 // 消息缓冲区刷新间隔。
@@ -42,9 +44,17 @@ type Model struct {
 	approvalWarning string
 
 	// 运行时
-	chatMode      bool
+	useChatRoom   bool // 强制多角色协作模式
 	chatRole      string
 	lastCallCount int
+
+	// ChatRoom 工厂（用于动态创建协作 Agent）
+	crClient   *llm.Client
+	crRegistry *tools.Registry
+	crApprover *agent.Approver
+	crWorkspace string
+	crFastModel string
+	crProModel  string
 
 	// 输入历史
 	inputHistory []string
@@ -63,12 +73,25 @@ type Model struct {
 }
 
 func NewModel(ag agent.AgentInterface, initialTask string) *Model {
-	return &Model{
+	m := &Model{
 		agent:       ag,
 		initialTask: initialTask,
 		chatCh:      make(chan string, 8),
 	}
+	return m
 }
+
+// InitChatRoom 保存创建 ChatRoom 所需的依赖，供切换模式时使用。
+func (m *Model) InitChatRoom(client *llm.Client, registry *tools.Registry, approver *agent.Approver, workspace, fastModel, proModel string) {
+	m.crClient = client
+	m.crRegistry = registry
+	m.crApprover = approver
+	m.crWorkspace = workspace
+	m.crFastModel = fastModel
+	m.crProModel = proModel
+}
+
+
 
 // Build 构建 tview widget 树并返回 Application。
 func (m *Model) Build() *tview.Application {
@@ -82,6 +105,8 @@ func (m *Model) Build() *tview.Application {
 	m.buildFooter()
 	m.buildLayout()
 	m.setupGlobalKeys()
+
+	m.app.EnableMouse(true)
 
 	m.pages = tview.NewPages().
 		AddPage("main", m.root, true, true)
@@ -143,6 +168,23 @@ func (m *Model) buildInput() {
 		SetText("", false)
 	m.input.SetBorder(true).SetTitle(" 输入（Enter 发送，Shift+Enter 换行）").SetBorderColor(Theme.ChatBorder)
 
+	// 鼠标滚轮：滚动聊天区而非输入历史
+	m.input.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
+		switch action {
+		case tview.MouseScrollUp:
+			row, _ := m.chatView.GetScrollOffset()
+			if row > 0 {
+				m.chatView.ScrollTo(row-3, 0)
+			}
+			return action, nil
+		case tview.MouseScrollDown:
+			row, _ := m.chatView.GetScrollOffset()
+			m.chatView.ScrollTo(row+3, 0)
+			return action, nil
+		}
+		return action, event
+	})
+
 	m.input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		// Shift+Enter → 换行（放行给 TextArea 自然处理）
 		if event.Key() == tcell.KeyEnter && event.Modifiers()&tcell.ModShift != 0 {
@@ -197,6 +239,33 @@ func (m *Model) buildInput() {
 		case tcell.KeyCtrlW:
 			m.sidebar.CycleMode()
 			return nil
+		case tcell.KeyCtrlM:
+			m.toggleChatRoom()
+			return nil
+		case tcell.KeyPgUp:
+			// 上翻聊天区一页
+			_, _, _, height := m.chatView.GetInnerRect()
+			row, _ := m.chatView.GetScrollOffset()
+			step := height - 2
+			if step < 1 {
+				step = 10
+			}
+			if row-step > 0 {
+				m.chatView.ScrollTo(row-step, 0)
+			} else {
+				m.chatView.ScrollToBeginning()
+			}
+			return nil
+		case tcell.KeyPgDn:
+			// 下翻聊天区一页
+			_, _, _, height := m.chatView.GetInnerRect()
+			row, _ := m.chatView.GetScrollOffset()
+			step := height - 2
+			if step < 1 {
+				step = 10
+			}
+			m.chatView.ScrollTo(row+step, 0)
+			return nil
 		}
 		return event
 	})
@@ -247,7 +316,12 @@ func (m *Model) adjustSidebarWidth() {
 func (m *Model) setupGlobalKeys() {
 	m.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if m.pendingApproval != nil {
-			return nil
+			// 审批弹窗显示时，只拦截 Ctrl+C，其他按键放行给 Modal
+			if event.Key() == tcell.KeyCtrlC {
+				m.app.Stop()
+				return nil
+			}
+			return event
 		}
 		switch event.Key() {
 		case tcell.KeyCtrlC:
@@ -428,6 +502,17 @@ func (m *Model) handleInput(text string) {
 	m.submitTask(text)
 }
 
+func (m *Model) toggleChatRoom() {
+	m.useChatRoom = !m.useChatRoom
+	if m.useChatRoom {
+		m.writeMsgBuf(tagLine(Theme.HighLight, "🔀 多角色协作模式已开启（PM→Dev→QA→验收）"))
+	} else {
+		m.writeMsgBuf(tagLine(Theme.Dim, "🔀 已切换为普通模式"))
+	}
+	m.flushMsgBuf()
+	m.refreshStatusBar()
+}
+
 func (m *Model) submitTask(text string) {
 	m.app.QueueUpdateDraw(func() {
 		m.flushMsgBuf()
@@ -435,7 +520,15 @@ func (m *Model) submitTask(text string) {
 		m.flushMsgBuf()
 		m.setFooterWork("⏳ 执行中...")
 	})
-	m.events = m.agent.RunAsync(text)
+
+	// 选择 Agent：强制 ChatRoom 或默认 Agent
+	if m.useChatRoom && m.crClient != nil {
+		ag := agent.NewChatRoom(m.crClient, m.crRegistry, m.crApprover, m.crWorkspace, m.crFastModel, m.crProModel)
+		m.agent = ag
+		m.events = ag.RunAsync(text)
+	} else {
+		m.events = m.agent.RunAsync(text)
+	}
 }
 
 // ── 审批弹窗 ──
@@ -623,10 +716,7 @@ func (m *Model) handleCommand(cmd string) {
 		m.writeMsgBuf(tagLine(Theme.UserMsg, fmt.Sprintf("✓ DeepSeek: %s", cfg.Model)))
 
 	case "/chatroom":
-		m.chatMode = true
-		m.chatRole = ""
-		m.sidebar.SetChatRole("", 0)
-		m.writeMsgBuf(tagLine(Theme.UserMsg, "🔀 多角色协作说明：使用 gowhale \"设计并实现一个XX\" 即可自动触发 PM→Dev→QA→验收 流转。"))
+		m.toggleChatRoom()
 
 	case "/exit":
 		m.flushMsgBuf()
@@ -685,6 +775,9 @@ func (m *Model) refreshStatusBar() {
 	tokens := m.agent.TokenCount()
 	m.statusBar.Clear()
 	left := fmt.Sprintf(" GoWhale v0.2  %s  │  %s token", model, formatTokens(tokens))
+	if m.useChatRoom {
+		left += "  │  🔀 协作模式"
+	}
 	if m.chatRole != "" {
 		label := roleLabel(m.chatRole)
 		if label != "" {

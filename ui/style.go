@@ -65,7 +65,7 @@ var Theme = struct {
 }
 
 // FooterHints 底部快捷键提示（显示在 footer 右侧）。
-const FooterHints = "↑↓:历史  Tab:侧栏  Ctrl+W:面板  Ctrl+C:退出"
+const FooterHints = "↑↓:历史  Tab:侧栏  Ctrl+W:面板  Ctrl+M:协作  Ctrl+C:退出  滚轮:聊天"
 
 // ── 工具图标 ──
 

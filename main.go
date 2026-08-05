@@ -53,6 +53,7 @@ func main() {
 		tools.VerifyTool{},
 		tools.RestoreTool{},
 		tools.ListDirTool{},
+		tools.GrepTool{},
 	)
 
 	approver := agent.NewApprover()
@@ -74,7 +75,7 @@ func main() {
 				task = strings.Join(os.Args[2:], " ")
 			}
 			ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
-			if err := ui.Run(ag, task); err != nil {
+			if err := ui.RunWithChatRoom(ag, client, registry, approver, workspace, cfg.Model, cfg.ProModel, task); err != nil {
 				fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 				os.Exit(1)
 			}
@@ -89,7 +90,7 @@ func main() {
 
 	// ── 无参数 → 默认 TUI 模式 ──
 	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
-	if err := ui.Run(ag, ""); err != nil {
+	if err := ui.RunWithChatRoom(ag, client, registry, approver, workspace, cfg.Model, cfg.ProModel, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 		os.Exit(1)
 	}
@@ -242,7 +243,7 @@ func handleCommand(input string, in *bufio.Reader, ag agent.AgentInterface, clie
 
 	case "/tui":
 		fmt.Println("正在启动 TUI 模式...")
-		if err := ui.Run(ag, ""); err != nil {
+		if err := ui.RunWithChatRoom(ag, client, registry, approver, workspace, cfg.Model, cfg.ProModel, ""); err != nil {
 			fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 		}
 

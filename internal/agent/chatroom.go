@@ -157,7 +157,16 @@ func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
 	role := RolePM
 	transition := ""
 
+	roleLabels := map[Role]string{
+		RolePM:        "产品经理：分析需求并制定技术规格",
+		RoleDev:       "程序员：根据规格实现代码",
+		RoleQA:        "测试：验证实现是否符合规格",
+		RoleUserProxy: "用户代理：验收并决定是否通过",
+	}
+
 	for round := 0; round < maxChatRoomRounds; round++ {
+		ch <- Event{Type: EventRoleChange, Role: string(role), Message: roleLabels[role], TokenCount: cr.totalTokens}
+
 		switch role {
 		case RolePM:
 			content, next := cr.runPMTurn(input, transition, ch)
@@ -180,7 +189,7 @@ func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
 		case RoleUserProxy:
 			decision, nextRole, done := cr.runUserProxyTurn(input, artifacts, ch)
 			if done {
-				ch <- Event{Type: EventDone, Message: decision, TokenCount: cr.totalTokens}
+				ch <- Event{Type: EventDone, Message: "[用户代理 验收通过]\n" + decision, TokenCount: cr.totalTokens}
 				cr.journal.Note("✅ " + decision)
 				return
 			}

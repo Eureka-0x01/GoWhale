@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"gowhale/internal/context"
 	"gowhale/internal/llm"
 	"gowhale/internal/tools"
 )
@@ -29,6 +30,7 @@ type Agent struct {
 	fastModel  string // 快速模型（简单问题）
 	proModel   string // 复杂模型（多步推理/代码生成）
 	totalTokens int   // 累计 token 消耗
+	projectOverview string // 项目扫描摘要（注入 system prompt）
 }
 
 const skillRules = "" +
@@ -112,9 +114,20 @@ func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTu
 	j := NewJournal(workspace)
 	dl := NewDebugLog(workspace)
 	constitution := loadConstitution(workspace)
+
+	// 扫描项目，生成上下文摘要
+	projInfo, scanErr := context.Scan(workspace)
+	projectOverview := ""
+	if scanErr == nil && projInfo != nil {
+		projectOverview = projInfo.Format()
+	}
+
 	base := egoBlock(workspace, constitution) + "\n" + skillRules
 
 	history := []llm.Message{{Role: "system", Content: base}}
+	if projectOverview != "" {
+		history = append(history, llm.Message{Role: "system", Content: projectOverview})
+	}
 	if recent := strings.TrimSpace(j.Recent(2000)); recent != "" {
 		history = append(history, llm.Message{
 			Role: "system",
@@ -134,6 +147,7 @@ func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTu
 		history:    history,
 		fastModel:  fastModel,
 		proModel:   proModel,
+		projectOverview: projectOverview,
 	}
 }
 
@@ -187,6 +201,16 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 		ch <- Event{Type: EventThinking, TokenCount: a.totalTokens}
 
 		a.debugLog.LLMRequest(len(a.history[0].Content), len(a.history), len(defs))
+		a.injectStageContext(turn, callCount)
+
+		// 上下文过大时自动压缩
+		if a.totalTokens <= 0 {
+			a.totalTokens = estimateTokens(a.history)
+		}
+		if a.totalTokens > 15000 {
+			a.Compact()
+		}
+
 		msg, usage, err := a.client.Chat(a.history, defs)
 		if err != nil {
 			a.debugLog.Error(fmt.Sprintf("调用失败: %v", err))
@@ -194,6 +218,10 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			return
 		}
 		a.totalTokens += usage.TotalTokens
+		// Ollama 模型可能不返回 token 统计（usage=0），用估算兜底
+		if a.totalTokens <= 0 {
+			a.totalTokens = estimateTokens(a.history) + estimateTokens([]llm.Message{msg})
+		}
 		a.history = append(a.history, msg)
 
 		// 记录 LLM 响应
@@ -477,7 +505,88 @@ const compactKeep = 20
 
 // Compact 压缩对话历史：保留 system prompt 和最近的消息，确保不截断 tool 配对。
 // 返回 true 表示实际执行了截断，false 表示消息不足无需压缩。
+
+// injectStageContext 根据当前阶段注入上下文提示。
+var stageInjected bool
+
+func (a *Agent) injectStageContext(turn, callCount int) {
+	if !stageInjected && turn == 0 && callCount == 0 {
+		// 规划阶段：提示模型先调研项目结构
+		a.history = append(a.history, llm.Message{
+			Role: "system",
+			Content: "[规划阶段] 任务刚开始。请先分析需求，用 write_plan 制定计划，用 list_dir / read_file 了解项目结构，不要急于写代码。",
+		})
+		stageInjected = true
+	} else if callCount >= MaxToolCalls-10 {
+		// 预算紧张（每5轮提示一次，避免干扰）
+		if callCount%5 == 0 {
+			a.history = append(a.history, llm.Message{
+				Role: "system",
+				Content: fmt.Sprintf("[执行阶段] 工具调用预算紧张（剩余 %d 次）。请优先完成核心功能，跳过非必要的验证步骤。", MaxToolCalls-callCount),
+			})
+		}
+	}
+}
+
+// Compact 使用 LLM 生成对话摘要来压缩上下文。
 func (a *Agent) Compact() bool {
+	if len(a.history) <= 10 {
+		return false
+	}
+	// Ollama 可能 token=0，用估算兜底
+	if a.totalTokens <= 0 {
+		a.totalTokens = estimateTokens(a.history)
+	}
+	beforeTokens := a.totalTokens
+	if beforeTokens < 1000 {
+		return false
+	}
+
+	// 用系统提示让模型总结已完成的工具调用
+	summarizePrompt := "请用一段简短的话总结上面对话中已经完成的操作和关键发现，不要遗漏重要细节。直接输出总结，不要用 markdown 格式。"
+	a.history = append(a.history, llm.Message{Role: "user", Content: summarizePrompt})
+
+	msg, usage, err := a.client.Chat(a.history, nil)
+	a.totalTokens += usage.TotalTokens
+	if err != nil {
+		// LLM 摘要失败，回退到简单截断
+		a.history = a.history[:len(a.history)-1] // remove prompt
+		return a.simpleCompact(beforeTokens)
+	}
+
+	// 移除 prompt 和 LLM 回复
+	a.history = a.history[:len(a.history)-2]
+
+	// 构建新的压缩历史：system prompt + 摘要 + 最近 4 条消息
+	sysCount := 0
+	for i, m := range a.history {
+		if m.Role == "system" {
+			sysCount = i + 1
+		}
+	}
+	keep := 4
+	if len(a.history)-sysCount < keep {
+		keep = len(a.history) - sysCount
+	}
+
+	newHistory := make([]llm.Message, 0, sysCount+1+keep)
+	newHistory = append(newHistory, a.history[:sysCount]...)
+	newHistory = append(newHistory, llm.Message{
+		Role: "system",
+		Content: fmt.Sprintf("[上下文已压缩] 之前的对话摘要：\n%s\n\n最近的操作记录：", msg.Content),
+	})
+
+	recent := a.history[len(a.history)-keep:]
+	newHistory = append(newHistory, recent...)
+
+	a.history = newHistory
+	a.totalTokens = estimateTokens(newHistory)
+	a.recentCmds = map[string]int{}
+	return true
+}
+
+// simpleCompact 当 LLM 摘要失败时的简单截断。
+func (a *Agent) simpleCompact(beforeTokens int) bool {
 	n := len(a.history)
 	if n <= compactKeep+2 {
 		if a.totalTokens <= 0 && n > 2 {
@@ -490,7 +599,7 @@ func (a *Agent) Compact() bool {
 	if a.totalTokens <= 0 {
 		a.totalTokens = estimateTokens(a.history)
 	}
-	beforeTokens := a.totalTokens
+	tokens := a.totalTokens
 
 	sysCount := 0
 	for sysCount < n && a.history[sysCount].Role == "system" {
@@ -514,7 +623,7 @@ func (a *Agent) Compact() bool {
 		"【上下文已压缩】之前的对话已截断（约 %s token）。"+
 			"如果当前任务依赖之前的上下文，请先回顾下方保留的最近消息；"+
 			"如有必要让用户重新描述需求。",
-		llm.FormatTokens(beforeTokens),
+		llm.FormatTokens(tokens),
 	)
 
 	newHistory := make([]llm.Message, 0, sysCount+1+(n-cutIdx))
