@@ -3,6 +3,7 @@ package agent
 import (
 	"bufio"
 	"encoding/json"
+	"time"
 	"fmt"
 	"os"
 	"strings"
@@ -30,8 +31,17 @@ type Agent struct {
 	fastModel  string // 快速模型（简单问题）
 	proModel   string // 复杂模型（多步推理/代码生成）
 	totalTokens int   // 累计 token 消耗
-	projectOverview string // 项目扫描摘要（注入 system prompt）
+	projectOverview string   // 项目扫描摘要（注入 system prompt）
+	modelLock       string   // 锁定模型（空=自动）
+	readFiles       map[string]bool // 已完整读取的文件（去重）
+	listDirs        map[string]bool // 已 list_dir 的参数（去重）
+	grepPatterns    map[string]bool // 已 grep_search 的 pattern（去重）
+	timeout         time.Duration // 单任务超时（0=不限）
 }
+
+// TaskTimeout 单次任务默认超时（10 分钟）。
+// 可通过 SetTimeout 调整或通过 --timeout 参数配置。
+const TaskTimeout = 10 * time.Minute
 
 const skillRules = "" +
 	"## 运行环境\n" +
@@ -122,7 +132,7 @@ func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTu
 		projectOverview = projInfo.Format()
 	}
 
-	base := egoBlock(workspace, constitution) + "\n" + skillRules
+	base := egoBlock(workspace, constitution) + "\n" + skillRules + "\n- 所有面向用户的输出必须使用简体中文。"
 
 	history := []llm.Message{{Role: "system", Content: base}}
 	if projectOverview != "" {
@@ -144,14 +154,32 @@ func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTu
 		debugLog:   dl,
 		maxTurns:   maxTurns,
 		recentCmds: map[string]int{},
+		readFiles:  map[string]bool{},
+		listDirs:   map[string]bool{},
+		grepPatterns: map[string]bool{},
 		history:    history,
 		fastModel:  fastModel,
 		proModel:   proModel,
 		projectOverview: projectOverview,
+		timeout:         TaskTimeout,
 	}
 }
 
 // ── 导出接口（供 TUI 使用）──
+
+// SetTimeout 设置任务超时。
+func (a *Agent) SetTimeout(d time.Duration) { a.timeout = d }
+
+// SetModelLock 锁定模型：非空时所有任务固定使用该模型；空字符串恢复自动。
+func (a *Agent) SetModelLock(name string) {
+	a.modelLock = strings.TrimSpace(name)
+	if a.modelLock != "" {
+		a.client.SetModel(a.modelLock)
+	}
+}
+
+// ModelLock 返回当前锁定的模型名（空 = 自动模式）。
+func (a *Agent) ModelLock() string { return a.modelLock }
 
 // Messages 返回当前消息历史副本。
 func (a *Agent) Messages() []llm.Message {
@@ -181,11 +209,17 @@ func (a *Agent) RunAsync(input string) <-chan Event {
 
 // runLoop 核心执行循环（在 goroutine 中运行）。
 func (a *Agent) runLoop(input string, ch chan<- Event) {
-	complex := a.classify(input)
-	if complex {
-		a.client.SetModel(a.proModel)
+	if a.modelLock != "" {
+		// 已锁定模型：固定使用
+		a.client.SetModel(a.modelLock)
 	} else {
-		a.client.SetModel(a.fastModel)
+		// 自动模式：按任务复杂度选择
+		complex := a.classify(input)
+		if complex {
+			a.client.SetModel(a.proModel)
+		} else {
+			a.client.SetModel(a.fastModel)
+		}
 	}
 
 	a.journal.Task(input + fmt.Sprintf(" [模型: %s]", a.client.Model()))
@@ -196,12 +230,50 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 	callCount := 0
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 2
+	stageInjected := false
+	readOnlyCalls := 0 // 累计单独 read_file 调用次数（跨轮统计）
+	exploreTurns := 0   // 连续只读轮次（探索上限）
 
-	for turn := 0; turn < a.maxTurns; turn++ {
+	startTime := time.Now()
+	maxExpand := a.maxTurns * 4 // 轮次自动扩展上限（初始的 4 倍）
+	for turn := 0; ; turn++ {
+		// 超时检查（跳过首轮——至少要启动一次）
+		if turn > 0 && a.timeout > 0 && time.Since(startTime) > a.timeout {
+			msg := fmt.Sprintf("任务超时（%v），已执行 %d 轮", a.timeout.Round(time.Second), turn)
+			a.debugLog.LimitHit("超时", turn, int(a.timeout.Seconds()))
+			a.finishWithSummary(msg, ch)
+			return
+		}
+
+		// 达到轮次上限：自动扩展一次（最多扩到初始的 4 倍）
+		if turn >= a.maxTurns {
+			if a.maxTurns < maxExpand {
+				a.maxTurns *= 2
+				a.debugLog.LimitHit("轮次自动扩展", turn, a.maxTurns)
+				a.history = append(a.history, llm.Message{
+					Role:    "system",
+					Content: fmt.Sprintf("轮次上限已自动扩展到 %d。请继续完成剩余工作，不要再重复已完成的操作。", a.maxTurns),
+				})
+			} else {
+				msg := fmt.Sprintf("达到最大轮数 %d", a.maxTurns)
+				a.debugLog.LimitHit("达到最大轮数", turn, a.maxTurns)
+				a.finishWithSummary(msg, ch)
+				return
+			}
+		}
 		ch <- Event{Type: EventThinking, TokenCount: a.totalTokens}
 
 		a.debugLog.LLMRequest(len(a.history[0].Content), len(a.history), len(defs))
-		a.injectStageContext(turn, callCount)
+		a.injectStageContext(turn, callCount, &stageInjected)
+
+		// 跨轮 read_file 合并警告：累计单独读取 >= 3 次 → 强制合并
+		if readOnlyCalls >= 3 {
+			a.history = append(a.history, llm.Message{
+				Role:    "system",
+				Content: fmt.Sprintf("【警告】你已累计 %d 次单独 read_file（无 paths 参数），严重浪费调用轮次。后续读取必须一次合并：用 {\"paths\": [\"a.go\", \"b.go\", \"c.go\"]} 批量读取，最多 20 个文件。再出现单独读取将直接拒绝。", readOnlyCalls),
+			})
+			readOnlyCalls = 0
+		}
 
 		// 上下文过大时自动压缩（消息 > 30 条 或 token > 8000）
 		if a.totalTokens <= 0 {
@@ -223,6 +295,11 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			a.totalTokens = estimateTokens(a.history) + estimateTokens([]llm.Message{msg})
 		}
 		a.history = append(a.history, msg)
+
+		// 输出模型思考/说明文字（调用工具前的 reasoning）
+		if len(msg.ToolCalls) > 0 && strings.TrimSpace(msg.Content) != "" {
+			ch <- Event{Type: EventMessage, Message: strings.TrimSpace(msg.Content), TokenCount: a.totalTokens}
+		}
 
 		// 记录 LLM 响应
 		tcNames := make([]string, len(msg.ToolCalls))
@@ -274,17 +351,16 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 		}
 
 		// ── 工具调用预算检查 ──
-		if callCount >= MaxToolCalls {
-			a.debugLog.LimitHit("达到最大工具调用次数", callCount, MaxToolCalls)
+		if callCount >= a.maxTurns {
+			a.debugLog.LimitHit("达到最大工具调用次数", callCount, a.maxTurns)
 			for _, tc := range msg.ToolCalls {
 				a.history = append(a.history, llm.Message{
 					Role:       "tool",
 					ToolCallID: tc.ID,
-					Content:    "已达到最大工具调用次数限制，任务终止。",
+					Content:    "已达到当前轮次上限，系统将自动扩展后继续。",
 				})
 			}
-			ch <- Event{Type: EventError, Message: "达到最大工具调用次数限制", TokenCount: a.totalTokens}
-			return
+			continue
 		}
 
 		// 预算紧张时的警告
@@ -319,6 +395,16 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			callCount++
 			step++
 
+			// 统计单文件 read_file 调用（无 paths 参数）
+			if tc.Function.Name == "read_file" {
+				var rargs struct {
+					Paths []string `json:"paths"`
+				}
+				if json.Unmarshal([]byte(tc.Function.Arguments), &rargs) != nil || len(rargs.Paths) == 0 {
+					readOnlyCalls++
+				}
+			}
+
 			toolArgs := compactArgs(tc.Function.Arguments)
 			ch <- Event{
 				Type:       EventToolCall,
@@ -331,7 +417,25 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			a.journal.Tool(tc.Function.Name, toolArgs)
 			a.debugLog.ToolCall(step, tc.Function.Name, tc.Function.Arguments)
 
-			result := a.executeWithApproval(tc, ch)
+			// 工具去重：read_file/list_dir/grep_search 重复调用 → 不执行
+			var result string
+			switch tc.Function.Name {
+			case "read_file":
+				if dedupMsg := a.dedupReadFile(tc.Function.Arguments); dedupMsg != "" {
+					result = dedupMsg
+				}
+			case "list_dir":
+				if dedupMsg := a.dedupListDir(tc.Function.Arguments); dedupMsg != "" {
+					result = dedupMsg
+				}
+			case "grep_search":
+				if dedupMsg := a.dedupGrep(tc.Function.Arguments); dedupMsg != "" {
+					result = dedupMsg
+				}
+			}
+			if result == "" {
+				result = a.executeWithApproval(tc, ch)
+			}
 			isErr := strings.HasPrefix(result, "执行出错：")
 			if isErr {
 				roundHadError = true
@@ -353,6 +457,27 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			})
 		}
 
+		// ── 探索上限：连续多轮只读（无写/执行）→ 强制收敛 ──
+		roundAllReadOnly := true
+		for _, tc := range msg.ToolCalls {
+			if !isReadOnlyTool(tc.Function.Name) {
+				roundAllReadOnly = false
+				break
+			}
+		}
+		if roundAllReadOnly {
+			exploreTurns++
+			if exploreTurns >= 5 {
+				a.history = append(a.history, llm.Message{
+					Role:    "system",
+					Content: "【探索上限】你已连续多轮只调用读取/搜索工具。基于已获得的信息，请立即输出结论，或执行有实际效果的操作（写文件/执行命令/调用计划工具）。不要再重复探索。",
+				})
+				exploreTurns = 0
+			}
+		} else {
+			exploreTurns = 0
+		}
+
 		// ── 失败触发反思：连续 2 轮有工具错误 → 注入反思提示 ──
 		if roundHadError {
 			consecutiveErrors++
@@ -367,7 +492,110 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			consecutiveErrors = 0
 		}
 	}
-	ch <- Event{Type: EventError, Message: fmt.Sprintf("达到最大轮数 %d，任务未完成", a.maxTurns), TokenCount: a.totalTokens}
+}
+
+// dedupReadFile 检查 read_file 调用是否重复读取已读文件。
+// 返回非空字符串表示拦截结果（去重提示）；返回空串表示正常执行。
+// 规则：
+//   - start_line <= 1（含无 start_line）视为完整读取，记录到已读集合；
+//   - 已完整读取的文件，任何再次读取（含分段 start_line）都拦截。
+func (a *Agent) dedupReadFile(argsRaw string) string {
+	var r struct {
+		Path      string   `json:"path"`
+		Paths     []string `json:"paths"`
+		StartLine int      `json:"start_line"`
+	}
+	if json.Unmarshal([]byte(argsRaw), &r) != nil {
+		return ""
+	}
+	paths := r.Paths
+	if len(paths) == 0 && r.Path != "" {
+		paths = []string{r.Path}
+	}
+	if len(paths) == 0 {
+		return ""
+	}
+	isFullRead := r.StartLine <= 1 // 无 start_line 或从开头读 → 视为完整读取
+
+	var dup []string
+	for _, f := range paths {
+		if a.readFiles[f] {
+			dup = append(dup, f) // 已完整读取 → 重复
+		} else if isFullRead {
+			a.readFiles[f] = true // 首次完整读取 → 记录
+		}
+		// 未完整读取过的分段读取（start_line > 1）→ 允许
+	}
+	if len(dup) > 0 {
+		return fmt.Sprintf("（去重）以下文件已完整读取，内容在上文上下文中，请直接使用，不要重复或分段读取：%s", strings.Join(dup, ", "))
+	}
+	return ""
+}
+
+// dedupListDir 检查 list_dir 调用是否重复（相同参数）。
+func (a *Agent) dedupListDir(argsRaw string) string {
+	key := compactArgs(argsRaw)
+	if key == "" {
+		return ""
+	}
+	if a.listDirs[key] {
+		return fmt.Sprintf("（去重）相同参数的 list_dir 已执行过，结果在上文上下文中，请直接使用，不要重复列出：%s", key)
+	}
+	a.listDirs[key] = true
+	return ""
+}
+
+// dedupGrep 检查 grep_search 调用是否重复（相同 pattern）。
+func (a *Agent) dedupGrep(argsRaw string) string {
+	var r struct {
+		Pattern string `json:"pattern"`
+	}
+	if json.Unmarshal([]byte(argsRaw), &r) != nil || r.Pattern == "" {
+		return ""
+	}
+	if a.grepPatterns[r.Pattern] {
+		return fmt.Sprintf("（去重）相同 pattern 的 grep_search 已执行过，结果在上文上下文中，请直接使用：%s", r.Pattern)
+	}
+	a.grepPatterns[r.Pattern] = true
+	return ""
+}
+
+// parseReadArgs 解析 read_file 参数，返回文件列表和是否局部读取。
+func parseReadArgs(raw string) (paths []string, hasRange bool) {
+	var r struct {
+		Path      string   `json:"path"`
+		Paths     []string `json:"paths"`
+		StartLine int      `json:"start_line"`
+		MaxLines  int      `json:"max_lines"`
+	}
+	if json.Unmarshal([]byte(raw), &r) != nil {
+		return nil, false
+	}
+	hasRange = r.StartLine > 0
+	if len(r.Paths) > 0 {
+		paths = r.Paths
+	} else if r.Path != "" {
+		paths = []string{r.Path}
+	}
+	return paths, hasRange
+}
+
+// finishWithSummary 任务异常终止（超时/轮次耗尽/调用失败）时，
+// 再调用一次大模型基于当前进度生成总结，确保用户始终有返回。
+func (a *Agent) finishWithSummary(reason string, ch chan<- Event) {
+	prompt := fmt.Sprintf("任务未能完成（%s）。请基于当前对话历史，用简洁的中文总结：1. 已完成的工作 2. 遇到的问题 3. 剩余未完成事项 4. 建议的下一步。不要提及轮次限制本身。", reason)
+	a.history = append(a.history, llm.Message{Role: "user", Content: prompt})
+
+	msg, usage, err := a.client.Chat(a.history, nil)
+	a.totalTokens += usage.TotalTokens
+	if err != nil {
+		ch <- Event{Type: EventError, Message: fmt.Sprintf("任务未完成（%s），且生成总结失败: %v", reason, err), TokenCount: a.totalTokens}
+		return
+	}
+	a.debugLog.Done("总结生成", a.totalTokens)
+	finalMsg := fmt.Sprintf("【任务未完成 · %s】\n%s", reason, msg.Content)
+	ch <- Event{Type: EventDone, Message: finalMsg, TokenCount: a.totalTokens}
+	a.journal.Note("⚠️ " + reason + "：" + msg.Content)
 }
 
 // executeWithApproval 执行单个工具调用（含审批流程）。
@@ -455,6 +683,10 @@ func (a *Agent) consumeEvents(events <-chan Event) {
 		case EventThinking:
 			// 终端模式下 spinner 由外部管理，不做额外输出
 
+		case EventMessage:
+			// 模型思考/说明文字
+			fmt.Printf("\r%s %s\n", dimC("AI >"), ev.Message)
+
 		case EventToolCall:
 			label := formatToolLabel(ev.Step, llm.ToolCall{
 				Function: llm.FunctionCall{Name: ev.ToolName, Arguments: ev.ToolArgs},
@@ -507,16 +739,14 @@ const compactKeep = 20
 // 返回 true 表示实际执行了截断，false 表示消息不足无需压缩。
 
 // injectStageContext 根据当前阶段注入上下文提示。
-var stageInjected bool
-
-func (a *Agent) injectStageContext(turn, callCount int) {
-	if !stageInjected && turn == 0 && callCount == 0 {
+func (a *Agent) injectStageContext(turn, callCount int, stageInjected *bool) {
+	if !*stageInjected && turn == 0 && callCount == 0 {
 		// 规划阶段：提示模型先调研项目结构
 		a.history = append(a.history, llm.Message{
 			Role: "system",
 			Content: "[规划阶段] 任务刚开始。请先分析需求，用 write_plan 制定计划，用 list_dir / read_file 了解项目结构，不要急于写代码。",
 		})
-		stageInjected = true
+		*stageInjected = true
 	} else if callCount >= MaxToolCalls-10 {
 		// 预算紧张（每5轮提示一次，避免干扰）
 		if callCount%5 == 0 {
@@ -671,6 +901,17 @@ func tokenBadge(n int) string {
 	return dimC(fmt.Sprintf("[📊 %s]", llm.FormatTokens(n)))
 }
 
+func truncateRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
+}
+
 func compactArgs(raw string) string {
 	var m map[string]any
 	if err := json.Unmarshal([]byte(raw), &m); err != nil {
@@ -715,7 +956,7 @@ func compactArgs(raw string) string {
 	if m["command"] != nil {
 		cmd := fmt.Sprint(m["command"])
 		if len(cmd) > 80 {
-			cmd = cmd[:80] + "…"
+			cmd = truncateRunes(cmd, 80) + "…"
 		}
 		return cmd
 	}
@@ -724,8 +965,8 @@ func compactArgs(raw string) string {
 	}
 	b, _ := json.Marshal(m)
 	s := string(b)
-	if len(s) > 80 {
-		s = s[:80] + "…"
+	if len([]rune(s)) > 80 {
+		s = truncateRunes(s, 80) + "…"
 	}
 	return s
 }
@@ -735,8 +976,8 @@ func statusLine(result string) string {
 	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
 		s = s[:idx]
 	}
-	if len(s) > 120 {
-		s = s[:120] + "…"
+	if len([]rune(s)) > 120 {
+		s = truncateRunes(s, 120) + "…"
 	}
 	switch {
 	case strings.Contains(result, "执行出错："):

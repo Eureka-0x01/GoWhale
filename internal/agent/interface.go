@@ -36,4 +36,11 @@ type AgentInterface interface {
 
 	// SwitchProvider 切换 LLM 提供商。
 	SwitchProvider(baseURL, apiKey, model, proModel string)
+
+	// SetModelLock 锁定模型：name 非空时所有任务固定使用该模型；
+	// 空字符串恢复自动模式（按任务复杂度切换 fast/pro）。
+	SetModelLock(name string)
+
+	// ModelLock 返回当前锁定的模型名（空 = 自动模式）。
+	ModelLock() string
 }

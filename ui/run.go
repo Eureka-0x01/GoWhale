@@ -19,8 +19,15 @@ func Run(ag agent.AgentInterface, initialTask string) error {
 	if err == nil {
 		defer term.Restore(fd, oldState)
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			term.Restore(fd, oldState)
+			panic(r)
+		}
+	}()
 
-	m := NewModel(ag, initialTask)
+	wd, _ := os.Getwd()
+	m := NewModel(ag, wd, initialTask)
 	return m.Build().Run()
 }
 
@@ -31,8 +38,15 @@ func RunWithChatRoom(ag agent.AgentInterface, client *llm.Client, registry *tool
 	if err == nil {
 		defer term.Restore(fd, oldState)
 	}
+	// panic 时也恢复终端（tview 内部异常不会吞掉 defer）
+	defer func() {
+		if r := recover(); r != nil {
+			term.Restore(fd, oldState)
+			panic(r)
+		}
+	}()
 
-	m := NewModel(ag, initialTask)
+	m := NewModel(ag, workspace, initialTask)
 	m.InitChatRoom(client, registry, approver, workspace, fastModel, proModel)
 	return m.Build().Run()
 }

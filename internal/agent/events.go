@@ -5,6 +5,7 @@ type EventType int
 
 const (
 	EventThinking       EventType = iota // LLM 调用中
+	EventMessage                         // 模型思考/说明文字（调用工具前的 reasoning）
 	EventToolCall                        // 工具即将执行
 	EventToolResult                      // 工具执行完成
 	EventToken                           // 流式 token（预留，暂未实现）

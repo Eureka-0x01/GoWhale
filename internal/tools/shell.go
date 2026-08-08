@@ -16,6 +16,14 @@ import (
 // maxOutput 限制返回给模型的输出长度，避免刷屏和撑爆上下文。
 const maxOutput = 4000
 
+func truncateByRunes(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
+}
+
 // ShellTool 执行 shell 命令。是否放行由审批门决定（见 Review）。
 type ShellTool struct{}
 

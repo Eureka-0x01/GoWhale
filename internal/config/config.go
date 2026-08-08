@@ -35,7 +35,7 @@ func Load() Config {
 		OllamaURL:   getenv("AICODE_OLLAMA_URL", ""),
 		OllamaModel: getenv("AICODE_OLLAMA_MODEL", ""),
 		Provider:    getenv("AICODE_PROVIDER", "deepseek"),
-		MaxTurns:    getenvInt("AICODE_MAX_TURNS", 40),
+		MaxTurns:    getenvInt("AICODE_MAX_TURNS", 100),
 	}
 
 	// 自动恢复上次使用的提供商

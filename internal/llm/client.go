@@ -54,7 +54,8 @@ type Client struct {
 }
 
 func NewClient(cfg config.Config) *Client {
-	return &Client{cfg: cfg, http: &http.Client{Timeout: 5 * time.Minute}}
+	// 2 分钟超时：正常响应几秒内完成，超时快速失败并报错，避免长时间"卡住"。
+	return &Client{cfg: cfg, http: &http.Client{Timeout: 2 * time.Minute}}
 }
 
 func (c *Client) Model() string    { return c.cfg.Model }
@@ -80,7 +81,10 @@ type chatRequest struct {
 
 type chatResponse struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Message struct {
+			Message
+			ReasoningContent string `json:"reasoning_content"`
+		} `json:"message"`
 	} `json:"choices"`
 	Usage *Usage `json:"usage,omitempty"`
 }
@@ -130,7 +134,14 @@ func (c *Client) Chat(messages []Message, tools []Tool) (Message, Usage, error) 
 	if parsed.Usage != nil {
 		usage = *parsed.Usage
 	}
-	msg := parsed.Choices[0].Message
+	rawMsg := parsed.Choices[0].Message
+	msg := rawMsg.Message
+
+	// DeepSeek 思考模式下，调用工具时的说明文字在 reasoning_content 字段，
+	// content 为空。把 reasoning 填入 content，让调用方（TUI/终端）能显示思考。
+	if strings.TrimSpace(msg.Content) == "" && strings.TrimSpace(rawMsg.ReasoningContent) != "" {
+		msg.Content = rawMsg.ReasoningContent
+	}
 
 	// 某些 Ollama 模型（如 qwen3-coder）返回 XML 格式的 tool_call，
 	// 而不是标准 JSON tool_calls。在此兼容解析。

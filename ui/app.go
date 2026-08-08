@@ -3,6 +3,8 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -15,7 +17,7 @@ import (
 )
 
 // 消息缓冲区刷新间隔。
-const flushInterval = 50 * time.Millisecond
+const flushInterval = 200 * time.Millisecond
 
 // Model 是 tview 应用状态。
 type Model struct {
@@ -65,20 +67,47 @@ type Model struct {
 	lastHintText string
 
 	// 消息缓冲
-	msgBuf     strings.Builder
-	hasPending bool
+	msgBuf      strings.Builder
+	hasPending  bool
+	msgPending  atomic.Bool // 消息缓冲有待刷内容（跨 goroutine 安全）
+	hintDirty   atomic.Bool // hintBar 内容变化待重绘
 
 	// 初始化
 	initialTask string
+	workspace   string
+	lineCount int // 写入 chatView 的行计数
+
+	// 退出控制
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
-func NewModel(ag agent.AgentInterface, initialTask string) *Model {
+func NewModel(ag agent.AgentInterface, workspace, initialTask string) *Model {
 	m := &Model{
 		agent:       ag,
 		initialTask: initialTask,
+		workspace:   workspace,
 		chatCh:      make(chan string, 8),
+		stopCh:      make(chan struct{}),
 	}
+	// 恢复项目级持久化设置
+	s := config.LoadProjectSettings(workspace)
+	if s.ModelLock != "" {
+		ag.SetModelLock(s.ModelLock)
+	}
+	m.useChatRoom = s.UseChatRoom
 	return m
+}
+
+// saveSettings 持久化当前设置到 .aicode/settings.json（按项目隔离）。
+func (m *Model) saveSettings() {
+	if m.workspace == "" {
+		return
+	}
+	config.SaveProjectSettings(m.workspace, config.ProjectSettings{
+		ModelLock:   m.agent.ModelLock(),
+		UseChatRoom: m.useChatRoom,
+	})
 }
 
 // InitChatRoom 保存创建 ChatRoom 所需的依赖，供切换模式时使用。
@@ -106,7 +135,7 @@ func (m *Model) Build() *tview.Application {
 	m.buildLayout()
 	m.setupGlobalKeys()
 
-	m.app.EnableMouse(true)
+	m.app.EnableMouse(false) // 关闭鼠标捕获，恢复操作系统原生拖拽选择
 
 	m.pages = tview.NewPages().
 		AddPage("main", m.root, true, true)
@@ -143,11 +172,16 @@ func (m *Model) buildChatView() {
 		SetWordWrap(true)
 	m.chatView.SetBorder(true).SetTitle(" 对话 ")
 	m.chatView.SetBorderColor(Theme.ChatBorder)
+	// 鼠标已关闭捕获（EnableMouse(false)），由操作系统提供原生拖拽选择：
+	// 按住左键拖动 → 系统高亮 → Ctrl+Shift+C 复制。滚轮滚动由 PgUp/PgDn
+	// 或输入框为空时的 ↑/↓ 键替代。
 
 	tasks := m.agent.LastTasks(10)
+	var initSB strings.Builder
 	for _, t := range tasks {
-		fmt.Fprintf(m.chatView, "%s▸ [%s] %s\n", tagOpen("cyan"), t.Time, escapeTags(t.Task))
+		initSB.WriteString(fmt.Sprintf("%s▸ [%s] %s\n", tagOpen("cyan"), t.Time, escapeTags(t.Task)))
 	}
+	m.writeChatLines(initSB.String())
 }
 
 func (m *Model) buildSidebar() {
@@ -167,23 +201,6 @@ func (m *Model) buildInput() {
 	m.input = tview.NewTextArea().
 		SetText("", false)
 	m.input.SetBorder(true).SetTitle(" 输入（Enter 发送，Shift+Enter 换行）").SetBorderColor(Theme.ChatBorder)
-
-	// 鼠标滚轮：滚动聊天区而非输入历史
-	m.input.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
-		switch action {
-		case tview.MouseScrollUp:
-			row, _ := m.chatView.GetScrollOffset()
-			if row > 0 {
-				m.chatView.ScrollTo(row-3, 0)
-			}
-			return action, nil
-		case tview.MouseScrollDown:
-			row, _ := m.chatView.GetScrollOffset()
-			m.chatView.ScrollTo(row+3, 0)
-			return action, nil
-		}
-		return action, event
-	})
 
 	m.input.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		// Shift+Enter → 换行（放行给 TextArea 自然处理）
@@ -213,18 +230,30 @@ func (m *Model) buildInput() {
 		}
 		switch event.Key() {
 		case tcell.KeyUp:
-			if len(m.inputHistory) > 0 && m.historyIdx > 0 {
+			// 输入框有内容 → 历史切换；为空 → 滚动聊天区（兼容滚轮转成的方向键）
+			if m.input.GetText() != "" && len(m.inputHistory) > 0 && m.historyIdx > 0 {
 				m.historyIdx--
 				m.input.SetText(m.inputHistory[m.historyIdx], false)
+			} else {
+				row, _ := m.chatView.GetScrollOffset()
+				if row > 0 {
+					m.chatView.ScrollTo(row-3, 0)
+				}
 			}
 			return nil
 		case tcell.KeyDown:
-			if m.historyIdx < len(m.inputHistory)-1 {
-				m.historyIdx++
-				m.input.SetText(m.inputHistory[m.historyIdx], false)
-			} else if m.historyIdx == len(m.inputHistory)-1 {
-				m.historyIdx = len(m.inputHistory)
-				m.input.SetText("", false)
+			// 输入框有内容 → 历史切换；为空 → 滚动聊天区
+			if m.input.GetText() != "" {
+				if m.historyIdx < len(m.inputHistory)-1 {
+					m.historyIdx++
+					m.input.SetText(m.inputHistory[m.historyIdx], false)
+				} else if m.historyIdx == len(m.inputHistory)-1 {
+					m.historyIdx = len(m.inputHistory)
+					m.input.SetText("", false)
+				}
+			} else {
+				row, _ := m.chatView.GetScrollOffset()
+				m.chatView.ScrollTo(row+3, 0)
 			}
 			return nil
 		case tcell.KeyTab:
@@ -236,35 +265,23 @@ func (m *Model) buildInput() {
 				m.adjustSidebarWidth()
 			}
 			return nil
+		case tcell.KeyPgUp:
+			// 滚动聊天区向上（原生选择模式下滚轮不可用的替代）
+			row, _ := m.chatView.GetScrollOffset()
+			if row > 0 {
+				m.chatView.ScrollTo(row-10, 0)
+			}
+			return nil
+		case tcell.KeyPgDn:
+			// 滚动聊天区向下
+			row, _ := m.chatView.GetScrollOffset()
+			m.chatView.ScrollTo(row+10, 0)
+			return nil
 		case tcell.KeyCtrlW:
 			m.sidebar.CycleMode()
 			return nil
 		case tcell.KeyCtrlM:
 			m.toggleChatRoom()
-			return nil
-		case tcell.KeyPgUp:
-			// 上翻聊天区一页
-			_, _, _, height := m.chatView.GetInnerRect()
-			row, _ := m.chatView.GetScrollOffset()
-			step := height - 2
-			if step < 1 {
-				step = 10
-			}
-			if row-step > 0 {
-				m.chatView.ScrollTo(row-step, 0)
-			} else {
-				m.chatView.ScrollToBeginning()
-			}
-			return nil
-		case tcell.KeyPgDn:
-			// 下翻聊天区一页
-			_, _, _, height := m.chatView.GetInnerRect()
-			row, _ := m.chatView.GetScrollOffset()
-			step := height - 2
-			if step < 1 {
-				step = 10
-			}
-			m.chatView.ScrollTo(row+step, 0)
 			return nil
 		}
 		return event
@@ -311,6 +328,14 @@ func (m *Model) adjustSidebarWidth() {
 	}
 }
 
+// stop 停止应用并退出事件循环（防止 app.Stop 后 goroutine 继续刷新屏幕导致闪烁）。
+func (m *Model) stop() {
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+	})
+	m.app.Stop()
+}
+
 // ── 全局按键 ──
 
 func (m *Model) setupGlobalKeys() {
@@ -318,14 +343,14 @@ func (m *Model) setupGlobalKeys() {
 		if m.pendingApproval != nil {
 			// 审批弹窗显示时，只拦截 Ctrl+C，其他按键放行给 Modal
 			if event.Key() == tcell.KeyCtrlC {
-				m.app.Stop()
+				m.stop()
 				return nil
 			}
 			return event
 		}
 		switch event.Key() {
 		case tcell.KeyCtrlC:
-			m.app.Stop()
+			m.stop()
 			return nil
 		}
 		return event
@@ -357,6 +382,9 @@ func (m *Model) eventLoop() {
 
 	for {
 		select {
+		case <-m.stopCh:
+			return // 应用已停止，退出事件循环（不再刷新屏幕）
+
 		case text := <-m.chatCh:
 			flush()
 			m.handleInput(text)
@@ -397,20 +425,25 @@ func (m *Model) eventLoop() {
 			pending = append(pending, ev)
 
 		case <-ticker.C:
-			flush()
-			// 轮询检测输入变化，更新命令提示
-			m.app.QueueUpdateDraw(func() {
-				text := m.input.GetText()
-				if text != m.lastHintText {
-					m.lastHintText = text
-					m.completionIdx = -1
-					if len(text) >= 1 {
-						m.updateHintBar(text)
-					} else {
-						m.hintBar.Clear()
+			// 有实际内容才重绘；空闲轮询只检测输入变化（不重绘，避免光标闪烁）
+			if len(pending) > 0 || m.msgPending.Load() || m.hintDirty.Load() {
+				m.app.QueueUpdateDraw(func() {
+					m.flushMsgBuf()
+					for _, ev := range pending {
+						m.applyEvent(ev)
 					}
-				}
-			})
+					pending = nil
+					m.checkHint()
+				})
+			} else {
+				m.app.QueueUpdate(func() {
+					text := m.input.GetText()
+					if text != m.lastHintText {
+						m.lastHintText = text
+						m.hintDirty.Store(true)
+					}
+				})
+			}
 		}
 	}
 }
@@ -448,6 +481,10 @@ func (m *Model) applyEvent(ev agent.Event) {
 		m.flushMsgBuf()
 		m.showApprovalModal(ev)
 
+	case agent.EventMessage:
+		// 模型思考/说明文字
+		m.writeMsgBuf("\n" + tagLine(Theme.ModelMsg, ev.Message))
+
 	case agent.EventToolCall:
 		m.lastCallCount = ev.CallCount
 		m.sidebar.AddStep(ev.Step, ev.ToolName, "pending", "")
@@ -477,6 +514,7 @@ func (m *Model) applyEvent(ev agent.Event) {
 func (m *Model) writeMsgBuf(s string) {
 	m.msgBuf.WriteString(s)
 	m.hasPending = true
+	m.msgPending.Store(true)
 }
 
 // flushMsgBuf 将缓冲区内容一次性写入 chatView。
@@ -485,9 +523,10 @@ func (m *Model) flushMsgBuf() {
 	if !m.hasPending {
 		return
 	}
-	m.chatView.Write([]byte(m.msgBuf.String()))
+	m.writeChatLines(m.msgBuf.String())
 	m.msgBuf.Reset()
 	m.hasPending = false
+	m.msgPending.Store(false)
 	m.chatView.ScrollToEnd()
 }
 
@@ -510,6 +549,7 @@ func (m *Model) toggleChatRoom() {
 	} else {
 		m.writeMsgBuf(tagLine(Theme.Dim, "🔀 已切换为普通模式"))
 	}
+	m.saveSettings()
 	m.flushMsgBuf()
 	m.refreshStatusBar()
 }
@@ -525,6 +565,7 @@ func (m *Model) submitTask(text string) {
 	// 选择 Agent：强制 ChatRoom 或默认 Agent
 	if m.useChatRoom && m.crClient != nil {
 		ag := agent.NewChatRoom(m.crClient, m.crRegistry, m.crApprover, m.crWorkspace, m.crFastModel, m.crProModel)
+		ag.SetModelLock(m.agent.ModelLock()) // 继承模型锁定
 		m.agent = ag
 		m.events = ag.RunAsync(text)
 	} else {
@@ -576,7 +617,8 @@ var commandList = []struct {
 	Desc string
 }{
 	{"/help", "帮助信息"},
-	{"/model", "查看当前模型"},
+	{"/model", "查看/锁定模型（/model auto 恢复自动）"},
+	{"/mouse", "切换鼠标模式：/mouse on=滚轮（Shift+拖拽复制） /mouse off=原生选择"},
 	{"/history", "查看最近对话记录"},
 	{"/clear", "清空对话历史"},
 	{"/compact", "压缩上下文节省 token"},
@@ -668,9 +710,15 @@ func commonPrefix(ss []string) string {
 }
 
 func (m *Model) handleCommand(cmd string) {
+	rawCmd := cmd
 	cmd = strings.ToLower(strings.TrimSpace(cmd))
+	// 分离命令名与参数："/model xxx" → name="/model"
+	name := cmd
+	if idx := strings.Index(cmd, " "); idx >= 0 {
+		name = cmd[:idx]
+	}
 
-	switch cmd {
+	switch name {
 	case "/help":
 		var sb strings.Builder
 		sb.WriteString(tagLine(Theme.UserMsg, "命令列表："))
@@ -682,8 +730,30 @@ func (m *Model) handleCommand(cmd string) {
 		m.flushMsgBuf()
 
 	case "/model":
-		_, _, model, proModel := m.agent.ProviderInfo()
-		m.writeMsgBuf(tagLine(Theme.UserMsg, fmt.Sprintf("当前: %s / %s", model, proModel)))
+		// /model           → 查看当前
+		// /model auto      → 恢复自动模式
+		// /model <名字>    → 锁定模型
+		args := ""
+		if idx := strings.Index(rawCmd, " "); idx >= 0 {
+			args = strings.TrimSpace(rawCmd[idx+1:])
+		}
+		if args == "" {
+			_, _, model, proModel := m.agent.ProviderInfo()
+			lock := m.agent.ModelLock()
+			if lock != "" {
+				m.writeMsgBuf(tagLine(Theme.UserMsg, fmt.Sprintf("当前模型: %s（锁定）  自动模式: %s / %s", lock, model, proModel)))
+			} else {
+				m.writeMsgBuf(tagLine(Theme.UserMsg, fmt.Sprintf("当前: %s / %s", model, proModel)))
+			}
+		} else if strings.EqualFold(args, "auto") {
+			m.agent.SetModelLock("")
+			_, _, model, proModel := m.agent.ProviderInfo()
+			m.writeMsgBuf(tagLine(Theme.UserMsg, fmt.Sprintf("✓ 自动模式: %s / %s", model, proModel)))
+		} else {
+			m.agent.SetModelLock(args)
+			m.writeMsgBuf(tagLine(Theme.UserMsg, fmt.Sprintf("✓ 已锁定模型: %s（所有任务固定使用）", args)))
+		}
+		m.saveSettings()
 
 	case "/history":
 		tasks := m.agent.LastTasks(10)
@@ -719,13 +789,48 @@ func (m *Model) handleCommand(cmd string) {
 	case "/chatroom":
 		m.toggleChatRoom()
 
+	case "/mouse":
+		// /mouse on|off：滚轮 vs 原生选择（Windows 终端协议两者互斥）
+		args := ""
+		if idx := strings.Index(rawCmd, " "); idx >= 0 {
+			args = strings.ToLower(strings.TrimSpace(rawCmd[idx+1:]))
+		}
+		if args == "on" {
+			m.app.EnableMouse(true)
+			m.writeMsgBuf(tagLine(Theme.UserMsg, "✓ 鼠标开启：滚轮滚动聊天区；复制 = Shift+拖拽 或 Ctrl+Shift+C"))
+		} else if args == "off" {
+			m.app.EnableMouse(false)
+			m.writeMsgBuf(tagLine(Theme.UserMsg, "✓ 鼠标关闭：操作系统原生拖拽选择；滚动用 PgUp/PgDn"))
+		} else {
+			m.writeMsgBuf(tagLine(Theme.UserMsg, "用法: /mouse on（滚轮+Shift拖拽复制） 或 /mouse off（原生选择+PgUp/PgDn滚动）"))
+		}
+
 	case "/exit":
 		m.flushMsgBuf()
-		m.app.Stop()
+		m.stop()
 
 	default:
 		m.writeMsgBuf(tagLine(Theme.TaskErr, fmt.Sprintf("未知命令: %s", cmd)))
 	}
+}
+
+// writeChatLines 把内容写入 chatView。
+func (m *Model) writeChatLines(content string) {
+	m.chatView.Write([]byte(content))
+}
+
+func (m *Model) checkHint() {
+	text := m.input.GetText()
+	if text != m.lastHintText {
+		m.lastHintText = text
+		m.completionIdx = -1
+		if len(text) >= 1 {
+			m.updateHintBar(text)
+		} else {
+			m.hintBar.Clear()
+		}
+	}
+	m.hintDirty.Store(false)
 }
 
 func (m *Model) updateHintBar(prefix string) {
@@ -776,6 +881,9 @@ func (m *Model) refreshStatusBar() {
 	tokens := m.agent.TokenCount()
 	m.statusBar.Clear()
 	left := fmt.Sprintf(" GoWhale v0.2  %s  │  %s token", model, formatTokens(tokens))
+	if lock := m.agent.ModelLock(); lock != "" {
+		left += "  │  🔒 " + lock
+	}
 	if m.useChatRoom {
 		left += "  │  🔀 协作模式"
 	}

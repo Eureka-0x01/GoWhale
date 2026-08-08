@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/c-bata/go-prompt"
 
@@ -34,7 +36,27 @@ var slashCommands = []prompt.Suggest{
 }
 
 func main() {
-	if len(os.Args) == 2 && (os.Args[1] == "--clear-key" || os.Args[1] == "-clear-key") {
+	showHelp := flag.Bool("help", false, "show help")
+	showVersion := flag.Bool("version", false, "show version")
+	timeoutMin := flag.Int("timeout", 10, "task timeout in minutes")
+	maxTurns := flag.Int("maxturns", 0, "max tool call turns (0 = config default)")
+	flag.Parse()
+	if *maxTurns > 0 {
+		os.Setenv("AICODE_MAX_TURNS", fmt.Sprint(*maxTurns))
+	}
+	if *showVersion { fmt.Println("GoWhale v" + version); return }
+	if *showHelp {
+		fmt.Println("GoWhale - Go AI coding assistant")
+		fmt.Println("Usage:")
+		fmt.Println("  gowhale                 TUI mode")
+		fmt.Println("  gowhale task            one-shot")
+		fmt.Println("  gowhale --tui [task]    TUI + init task")
+		fmt.Println("  gowhale --classic       classic prompt")
+		fmt.Println()
+		flag.PrintDefaults()
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "--clear-key" {
 		clearAPIKey(bufio.NewReader(os.Stdin))
 		return
 	}
@@ -59,12 +81,15 @@ func main() {
 	approver := agent.NewApprover()
 	workspace, _ := os.Getwd()
 	tools.SetWorkspace(workspace)
+	projSettings := config.LoadProjectSettings(workspace)
 
 	// ── 有参数 ──
 	if len(os.Args) > 1 {
 		// --classic → 旧 go-prompt 交互模式
 		if os.Args[1] == "--classic" {
 			ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
+				ag.SetTimeout(time.Duration(*timeoutMin) * time.Minute)
+			ag.SetModelLock(projSettings.ModelLock)
 			runClassic(ag, cfg, client, registry, approver, workspace)
 			return
 		}
@@ -75,6 +100,8 @@ func main() {
 				task = strings.Join(os.Args[2:], " ")
 			}
 			ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
+				ag.SetTimeout(time.Duration(*timeoutMin) * time.Minute)
+			ag.SetModelLock(projSettings.ModelLock)
 			if err := ui.RunWithChatRoom(ag, client, registry, approver, workspace, cfg.Model, cfg.ProModel, task); err != nil {
 				fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 				os.Exit(1)
@@ -83,13 +110,15 @@ func main() {
 		}
 		// 一次性任务（自动检测是否需要多角色协作）
 		task := strings.Join(os.Args[1:], " ")
-		ag := selectAgent(task, client, cfg, registry, approver, workspace)
+		ag := selectAgent(task, client, cfg, registry, approver, workspace, *timeoutMin)
 		ag.Run(task)
 		return
 	}
 
 	// ── 无参数 → 默认 TUI 模式 ──
 	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
+				ag.SetTimeout(time.Duration(*timeoutMin) * time.Minute)
+			ag.SetModelLock(projSettings.ModelLock)
 	if err := ui.RunWithChatRoom(ag, client, registry, approver, workspace, cfg.Model, cfg.ProModel, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI 错误: %v\n", err)
 		os.Exit(1)
@@ -97,14 +126,20 @@ func main() {
 }
 
 // selectAgent 根据任务复杂度选择 Agent 类型。
-func selectAgent(task string, client *llm.Client, cfg config.Config, registry *tools.Registry, approver *agent.Approver, workspace string) agent.AgentInterface {
+func selectAgent(task string, client *llm.Client, cfg config.Config, registry *tools.Registry, approver *agent.Approver, workspace string, timeoutMin int) agent.AgentInterface {
+	ps := config.LoadProjectSettings(workspace)
 	if agent.ClassifyChatRoom(task, client) {
-		fmt.Println("🔀 检测到复杂任务，启用多角色协作模式（产品经理→程序员→测试→用户代理）")
-		return agent.NewChatRoom(client, registry, approver, workspace, cfg.Model, cfg.ProModel)
+		fmt.Println("🔀 🔀 检测到复杂任务，启用多角色协作模式")
+		cr := agent.NewChatRoom(client, registry, approver, workspace, cfg.Model, cfg.ProModel)
+		cr.SetTimeout(time.Duration(timeoutMin) * time.Minute)
+		cr.SetModelLock(ps.ModelLock)
+		return cr
 	}
-	return agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
+	ag := agent.New(client, registry, approver, cfg.MaxTurns, workspace, cfg.Model, cfg.ProModel)
+	ag.SetTimeout(time.Duration(timeoutMin) * time.Minute)
+	ag.SetModelLock(ps.ModelLock)
+	return ag
 }
-
 // runClassic 启动传统的 go-prompt 交互模式（通过 --classic 参数进入）。
 func runClassic(ag agent.AgentInterface, cfg config.Config, client *llm.Client, registry *tools.Registry, approver *agent.Approver, workspace string) {
 	printBanner(cfg)
@@ -208,7 +243,12 @@ func printBanner(cfg config.Config) {
 
 func handleCommand(input string, in *bufio.Reader, ag agent.AgentInterface, client *llm.Client, cfg config.Config, registry *tools.Registry, approver *agent.Approver, workspace string) bool {
 	cmd := strings.ToLower(strings.TrimSpace(input))
-	switch cmd {
+	// 分离命令名与参数："/model xxx" → name="/model"
+	name := cmd
+	if idx := strings.Index(cmd, " "); idx >= 0 {
+		name = cmd[:idx]
+	}
+	switch name {
 	case "/help":
 		fmt.Println("\n命令列表（/ 下拉也可查看）：")
 		for _, s := range slashCommands {
@@ -217,10 +257,29 @@ func handleCommand(input string, in *bufio.Reader, ag agent.AgentInterface, clie
 		fmt.Printf("\n当前上下文用量: %s token\n", llm.FormatTokens(ag.TokenCount()))
 
 	case "/model":
-		cfg := config.Load()
-		provider := cfg.Provider
-		if provider == "" { provider = "deepseek" }
-		fmt.Printf("\n提供商: %s\n简单任务: %s\n复杂任务: %s\n\n", provider, cfg.Model, cfg.ProModel)
+		// /model           → 查看当前
+		// /model auto      → 恢复自动模式
+		// /model <名字>    → 锁定模型
+		args := ""
+		if idx := strings.Index(input, " "); idx >= 0 {
+			args = strings.TrimSpace(input[idx+1:])
+		}
+		if args == "" {
+			cfg := config.Load()
+			provider := cfg.Provider
+			if provider == "" { provider = "deepseek" }
+			if lock := ag.ModelLock(); lock != "" {
+				fmt.Printf("\n提供商: %s\n当前: %s（锁定）\n简单任务: %s\n复杂任务: %s\n\n", provider, lock, cfg.Model, cfg.ProModel)
+			} else {
+				fmt.Printf("\n提供商: %s\n简单任务: %s\n复杂任务: %s\n（当前为自动模式）\n\n", provider, cfg.Model, cfg.ProModel)
+			}
+		} else if strings.EqualFold(args, "auto") {
+			ag.SetModelLock("")
+			fmt.Println("✓ 已恢复自动模式（按任务复杂度切换模型）")
+		} else {
+			ag.SetModelLock(args)
+			fmt.Printf("✓ 已锁定模型: %s（所有任务固定使用）\n", args)
+		}
 
 	case "/clear":
 		fmt.Println("✓ 对话历史已清空。输入 /exit 退出后重新进即可完全重置。")

@@ -30,6 +30,7 @@ var Theme = struct {
 
 	// 文本颜色标签（用于 tview DynamicColors）
 	UserMsg   string // 用户输入
+	ModelMsg  string // 模型思考/说明
 	ToolCall  string // 工具调用
 	ToolOK    string // 工具成功
 	ToolErr   string // 工具失败
@@ -54,6 +55,7 @@ var Theme = struct {
 	TabInactiveFg: tcell.ColorGray,
 
 	UserMsg:   "cyan",
+	ModelMsg:  "lightgreen",
 	ToolCall:  "darkcyan",
 	ToolOK:    "gray",
 	ToolErr:   "red",
@@ -65,7 +67,7 @@ var Theme = struct {
 }
 
 // FooterHints 底部快捷键提示（显示在 footer 右侧）。
-const FooterHints = "↑↓:历史  Tab:侧栏  Ctrl+W:面板  Ctrl+M:协作  Ctrl+C:退出  滚轮:聊天"
+const FooterHints = "↑↓:历史 滚轮:聊天  Ctrl+Shift+C:复制  Ctrl+W:面板  Ctrl+M:协作  Ctrl+C:退出"
 
 // ── 工具图标 ──
 
