@@ -54,8 +54,8 @@ type Client struct {
 }
 
 func NewClient(cfg config.Config) *Client {
-	// 2 分钟超时：正常响应几秒内完成，超时快速失败并报错，避免长时间"卡住"。
-	return &Client{cfg: cfg, http: &http.Client{Timeout: 2 * time.Minute}}
+	// 5 分钟超时：部分模型（尤其是推理模型）可能需要较长时间生成响应。
+	return &Client{cfg: cfg, http: &http.Client{Timeout: 5 * time.Minute}}
 }
 
 func (c *Client) Model() string    { return c.cfg.Model }

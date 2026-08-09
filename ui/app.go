@@ -135,7 +135,23 @@ func (m *Model) Build() *tview.Application {
 	m.buildLayout()
 	m.setupGlobalKeys()
 
-	m.app.EnableMouse(false) // 关闭鼠标捕获，恢复操作系统原生拖拽选择
+	m.app.EnableMouse(true) // 开启鼠标：滚轮滚动聊天区、点击聚焦
+
+	// Shift+拖拽 → 临时释放鼠标给终端做原生文本选择，松手后自动恢复滚轮。
+	var mouseTimer *time.Timer
+	m.app.SetMouseCapture(func(event *tcell.EventMouse, action tview.MouseAction) (*tcell.EventMouse, tview.MouseAction) {
+		if event.Modifiers()&tcell.ModShift != 0 {
+			// 每次 Shift+鼠标事件都重置计时器，拖拽期间保持释放状态
+			if mouseTimer != nil {
+				mouseTimer.Stop()
+			}
+			m.app.EnableMouse(false)
+			mouseTimer = time.AfterFunc(1500*time.Millisecond, func() {
+				m.app.QueueUpdateDraw(func() { m.app.EnableMouse(true) })
+			})
+		}
+		return event, action
+	})
 
 	m.pages = tview.NewPages().
 		AddPage("main", m.root, true, true)
@@ -172,9 +188,8 @@ func (m *Model) buildChatView() {
 		SetWordWrap(true)
 	m.chatView.SetBorder(true).SetTitle(" 对话 ")
 	m.chatView.SetBorderColor(Theme.ChatBorder)
-	// 鼠标已关闭捕获（EnableMouse(false)），由操作系统提供原生拖拽选择：
-	// 按住左键拖动 → 系统高亮 → Ctrl+Shift+C 复制。滚轮滚动由 PgUp/PgDn
-	// 或输入框为空时的 ↑/↓ 键替代。
+	// 鼠标：滚轮滚动聊天区，点击聚焦输入框。
+	// 文本选择：按住 Shift + 拖拽 → 原生选择（自动暂停鼠标捕获），松手 1.5 秒后恢复滚轮。
 
 	tasks := m.agent.LastTasks(10)
 	var initSB strings.Builder
@@ -618,7 +633,7 @@ var commandList = []struct {
 }{
 	{"/help", "帮助信息"},
 	{"/model", "查看/锁定模型（/model auto 恢复自动）"},
-	{"/mouse", "切换鼠标模式：/mouse on=滚轮（Shift+拖拽复制） /mouse off=原生选择"},
+	{"/mouse", "切换鼠标：/mouse on=滚轮+Shift选择(默认)  /mouse off=纯原生选择"},
 	{"/history", "查看最近对话记录"},
 	{"/clear", "清空对话历史"},
 	{"/compact", "压缩上下文节省 token"},
@@ -880,7 +895,7 @@ func (m *Model) refreshStatusBar() {
 	model := m.agent.ModelName()
 	tokens := m.agent.TokenCount()
 	m.statusBar.Clear()
-	left := fmt.Sprintf(" GoWhale v0.2  %s  │  %s token", model, formatTokens(tokens))
+	left := fmt.Sprintf(" GoWhale v0.3  %s  │  %s token", model, formatTokens(tokens))
 	if lock := m.agent.ModelLock(); lock != "" {
 		left += "  │  🔒 " + lock
 	}

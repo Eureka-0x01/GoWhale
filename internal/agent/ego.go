@@ -72,79 +72,54 @@ func (c *Constitution) render() string {
 	return b.String()
 }
 
+// renderCompact 精简版宪法渲染（用于 egoBlock）。
+func (c *Constitution) renderCompact() string {
+	var b strings.Builder
+	if len(c.ProtectedInvariants) > 0 {
+		b.WriteString("\n项目规则（.aicode/constitution.json）：\n")
+		for _, item := range c.ProtectedInvariants {
+			b.WriteString(fmt.Sprintf("- %s\n", item))
+		}
+	}
+	return b.String()
+}
+
 // ---------- 工作区身份构建 ----------
 
-// egoBlock 构建 CodeWhale 风格的系统提示。分层注入：
-//   1) 工作区身份  2) 第一原则  3) 宪法  4) 权威排序  5) 升级规则  6) 对话判断
+// egoBlock 构建统一的系统提示。所有规则集中在此，不再分离 skillRules。
 func egoBlock(workspace string, c *Constitution) string {
+	abs, _ := filepath.Abs(workspace)
 	var b strings.Builder
 
-	// ── 第一层：你是谁、在哪、边界在哪 ──
-	abs, _ := filepath.Abs(workspace)
-	b.WriteString("<workspace_identity>\n")
-	b.WriteString(fmt.Sprintf("工作目录: %s | 操作系统: %s/%s\n", abs, runtime.GOOS, runtime.GOARCH))
-	b.WriteString(envBlock())
-	b.WriteString("1. **所有文件操作和命令执行必须限定在当前工作目录内**。\n")
-	b.WriteString("2. **绝对禁止** cd 到其他目录进行操作、在其他目录创建项目、或用绝对路径指向外部。\n")
-	b.WriteString("3. 需要创建新项目时在当前工作目录下建子目录。越界操作会被系统直接拦截。\n")
-	b.WriteString("</workspace_identity>\n")
+	// ── 身份与环境 ──
+	b.WriteString(fmt.Sprintf("你是 GoWhale CLI 编程助手。工作目录: %s，OS: %s/%s。\n", abs, runtime.GOOS, runtime.GOARCH))
+	b.WriteString(envBlockCompact())
+	b.WriteString("所有文件操作和命令限定在工作目录内，禁止越界。\n")
 
-	// ── 第二层：第一原则（CodeWhale Constitution 五原则）──
-	b.WriteString("\n<first_principles>\n")
-	b.WriteString("以下是你必须遵守的最高原则，任何情况下不得违反：\n\n")
-	b.WriteString("**1. 证据优于叙述（Evidence outranks narration）**\n")
-	b.WriteString("工具返回的真实输出 > 你的猜测。一个失败的命令就是失败的命令——如实报告，")
-	b.WriteString("不要粉饰、不要猜测「可能是 X 原因」而不去验证。验证是任务的一部分，")
-	b.WriteString("不是可选的收尾。命令失败了，先读错误输出和配置文件诊断根因，")
-	b.WriteString("不要换几个写法盲目重试。\n\n")
-	b.WriteString("**2. 用户意图最高（User intent stays sovereign）**\n")
-	b.WriteString("当前用户请求的权威 > 仓库规则 > 历史记录 > 记忆 > 你的推测。")
-	b.WriteString("用户说东你不往西，哪怕你觉得西边更合理。被拒绝时解释原因、提供替代方案，")
-	b.WriteString("但不要换方式强行绕过。\n\n")
-	b.WriteString("**3. 身份可寻址（Ego is addressable）**\n")
-	b.WriteString("你是绑定在这个终端、这个工作目录、这个会话里的实例。")
-	b.WriteString("你不是一个通用的模型卡片或排行榜分数。你的行为对当前用户和当前目录负责。\n\n")
-	b.WriteString("**4. 本地法律明确（Local law is explicit）**\n")
-	b.WriteString("项目可以在 .aicode/constitution.json 中定义持久的项目规则。")
-	b.WriteString("这些规则仅次于用户请求，高于你的历史记忆。\n\n")
-	b.WriteString("**5. 运行时策略由代码执行（Runtime policy is enforced）**\n")
-	b.WriteString("审批门、工作区边界、越界拦截不是你「记住」的建议，而是系统硬执行的策略。")
-	b.WriteString("你不需要自己实现它们——系统已替你拦住。")
-	b.WriteString("如果你的操作被拦，如实告诉用户被拦的原因，不要换方式继续尝试绕过。\n")
-	b.WriteString("</first_principles>\n")
-
-	// ── 第三层：宪法 ──
+	// ── 宪法（如果存在）──
 	if c != nil {
-		b.WriteString("\n" + c.render() + "\n")
+		b.WriteString(c.renderCompact())
 	}
 
-	// ── 第四层：权威排序 ──
-	b.WriteString("\n<authority_rules>\n")
-	b.WriteString("当指令冲突时，按此优先级：\n")
-	b.WriteString("1. 用户当前请求（最高，不可覆盖）\n")
-	b.WriteString("2. first_principles 五大原则（宪法级）\n")
-	b.WriteString("3. .aicode/constitution.json 项目规则\n")
-	b.WriteString("4. 已有代码和测试的实况（用工具读，不要猜）\n")
-	b.WriteString("5. 工作日志和会话历史\n")
-	b.WriteString("6. 你的推测和记忆（最低，随时可被以上推翻）\n")
-	b.WriteString("</authority_rules>\n")
-
-	// ── 第五层：升级规则 ──
-	b.WriteString("\n<escalation_rules>\n")
-	b.WriteString("以下情况**必须立即停止当前操作**，向用户汇报后等待指示，不得自行继续：\n")
-	b.WriteString("- 你要做的操作是破坏性的（删除、覆盖、递归修改）且用户未明确授权\n")
-	b.WriteString("- 命令连续失败 2 次，你无法从错误输出中确定根因\n")
-	b.WriteString("- 你要操作的文件的真实内容与你的假设不符\n")
-	b.WriteString("- 你要 cd 到工作目录之外，或用绝对路径指向工作区外\n")
-	b.WriteString("- 你对操作的安全性不确定\n")
-	b.WriteString("</escalation_rules>\n")
-
-	// ── 第六层：对话判断 ──
-	b.WriteString("\n<conversation_rules>\n")
-	b.WriteString("- 用户只是在询问/解释/闲聊 → **直接文字回答，不调用任何工具**\n")
-	b.WriteString("- 用户明确要求你**执行操作**（改代码、跑命令、建文件等）→ 才调用工具\n")
-	b.WriteString("- 被问「为什么」→ 任务是解释，不是继续执行\n")
-	b.WriteString("</conversation_rules>\n")
+	// ── 操作规则（优先级从高到低）──
+	b.WriteString("\n## 操作规则\n\n")
+	b.WriteString("**1. 批量操作 —— 最重要**\n")
+	b.WriteString("- 读 ≥2 个文件 → 用 read_file 的 `paths` 数组参数，一次完成。例: {\"paths\": [\"a.go\",\"b.go\"]}\n")
+	b.WriteString("- 写 ≥2 个文件 → 必须用 batch_write 的 `files` map 参数一次提交。严禁逐个 write_file\n")
+	b.WriteString("- 大文件分段读 → `start_line` + `max_lines`。禁止用 sed/head/tail 等 OS 命令读文件\n")
+	b.WriteString("- 路径不存在 → 先 list_dir 确认，禁止猜测后重试\n\n")
+	b.WriteString("**2. 收敛纪律**\n")
+	b.WriteString("- 验证通过 → 立即输出「执行完成」并停止。不要追加确认或优化\n")
+	b.WriteString("- 复杂任务(3+步) → 先 write_plan 制定计划\n")
+	b.WriteString("- 连续只读不写 → 用已有信息总结当前状态，然后结束\n")
+	b.WriteString("- 同一命令失败/被拒 2 次 → 换方案，不要换参数重试\n\n")
+	b.WriteString("**3. 命令执行**\n")
+	b.WriteString("- 后台服务: `background: true`，禁止 start/nohup/&。服务已运行别 kill\n")
+	b.WriteString("- 失败先读错误输出和配置文件诊断根因。同一命令最多 2 种写法\n\n")
+	b.WriteString("**4. 对话判断**\n")
+	b.WriteString("- 用户闲聊/询问 → 直接文字回答，不调用工具\n")
+	b.WriteString("- 用户要求执行操作 → 调用工具\n\n")
+	b.WriteString("所有面向用户的输出使用简体中文。\n")
 
 	return b.String()
 }
@@ -197,65 +172,34 @@ func ensureDefaultConstitution(workspace string) {
 	_ = os.WriteFile(p, []byte(defaultConstitution), 0o644)
 }
 
-// envBlock 运行时动态检测执行环境，告诉模型操作系统、shell、可用命令。
-// 所有 shell 相关规则集中在此，避免 skillRules 硬编码假设。
-func envBlock() string {
+// envBlockCompact 精简版环境信息（Shell、命令语法、可用工具）。
+func envBlockCompact() string {
 	var b strings.Builder
-	b.WriteString("## 运行环境（极其重要！所有命令必须适配此环境）\n\n")
 
-	// ── OS 基本信息 ──
-	osName := runtime.GOOS
-	switch osName {
-	case "windows":
-		osName = "Windows"
-	case "linux":
-		osName = "Linux"
-	case "darwin":
-		osName = "macOS"
-	}
-	b.WriteString(fmt.Sprintf("- 操作系统: %s (%s/%s)\n", osName, runtime.GOOS, runtime.GOARCH))
-
-	// ── Shell 检测 ──
 	shellName := "sh"
 	if runtime.GOOS == "windows" {
-		shellName = "cmd" // Windows 始终用 cmd，不依赖 Git Bash 的 sh
-	} else {
-		if _, err := exec.LookPath("bash"); err == nil {
-			shellName = "bash"
-		}
+		shellName = "cmd"
+	} else if _, err := exec.LookPath("bash"); err == nil {
+		shellName = "bash"
 	}
-	b.WriteString(fmt.Sprintf("- Shell: %s\n", shellName))
+	b.WriteString(fmt.Sprintf("Shell: %s。", shellName))
 
-	// ── OS 特定命令对照 ──
 	if runtime.GOOS == "windows" {
-		b.WriteString("- ⚠️ 命令使用 cmd 语法（Windows），禁止用 Unix 命令:\n")
-		b.WriteString("  列目录=dir | 搜索文本=findstr | 查看文件=type | 删除=del | 移动=move | 复制=copy\n")
-		b.WriteString("  重定向: 2>&1 | 丢弃: >nul 2>nul | 管道: |\n")
-		b.WriteString("  路径分隔: \\ | 多命令: && | 变量: %VAR%\n")
-		b.WriteString("  🚫 绝对禁止: grep, sed, awk, cat, ls, rm, 2>/dev/null, ||\n")
+		b.WriteString(" 命令用 cmd 语法：dir/findstr/type/del/move/copy，禁止 grep/sed/awk/cat/ls/rm。")
 	} else {
-		b.WriteString("- 命令使用 sh/bash 语法（Unix 风格）:\n")
-		b.WriteString("  列目录=ls | 搜索文本=grep | 查看文件=cat | 删除=rm | 移动=mv | 复制=cp\n")
-		b.WriteString("  重定向: 2>&1 | 丢弃: >/dev/null 2>&1\n")
-		b.WriteString("  路径分隔: / | 多命令: && 或 ; | 变量: $VAR\n")
+		b.WriteString(" 命令用 bash 语法。")
 	}
 
-	// ── 可用工具 ──
-	b.WriteString("- 已检测到的开发工具: ")
+	b.WriteString(" 可用工具: ")
 	found := false
-	for _, cmd := range []string{"go", "java", "mvn", "python3", "python", "node", "npm", "git", "curl", "docker", "make", "cargo", "rustc"} {
+	for _, cmd := range []string{"go", "java", "python3", "python", "node", "npm", "git", "curl", "docker", "make", "cargo"} {
 		if _, err := exec.LookPath(cmd); err == nil {
-			if found {
-				b.WriteString(", ")
-			}
+			if found { b.WriteString(", ") }
 			b.WriteString(cmd)
 			found = true
 		}
 	}
-	if !found {
-		b.WriteString("(无)")
-	}
-	b.WriteString("\n")
-
+	if !found { b.WriteString("(无)") }
+	b.WriteString("。\n")
 	return b.String()
 }

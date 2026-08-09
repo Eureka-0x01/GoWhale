@@ -15,7 +15,57 @@ import (
 )
 
 // MaxToolCalls 单次任务总工具调用次数上限（含只读工具）。
-const MaxToolCalls = 40
+const MaxToolCalls = 30
+
+// workEntry 工作记忆中的一条记录。
+type workEntry struct {
+	tool   string // 工具名
+	args   string // 压缩后的参数
+	result string // 极短摘要（最多一行）
+	isErr  bool   // 是否失败
+}
+
+// workLogBlob 将工作记录渲染成注入上下文的文本块。
+func workLogBlob(entries []workEntry, turn, callCount int) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("【工作记录 · 第%d轮 · 已用%d次工具调用】\n", turn, callCount))
+	for i, e := range entries {
+		mark := "✓"
+		if e.isErr {
+			mark = "✗"
+		}
+		summary := e.result
+		if len(summary) > 100 {
+			summary = truncateRunes(summary, 100)
+		}
+		// 失败的操作标注"勿重复"
+		repeatHint := ""
+		if e.isErr {
+			repeatHint = " (勿重复)"
+		}
+		b.WriteString(fmt.Sprintf("%s %d. %s %s → %s%s\n", mark, i+1, e.tool, e.args, summary, repeatHint))
+	}
+	return b.String()
+}
+
+// workSummary 压缩工具执行结果为一行摘要。
+func workSummary(result string) string {
+	s := result
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = s[:idx]
+	}
+	s = strings.TrimSpace(s)
+	if len(s) > 120 {
+		s = truncateRunes(s, 120)
+	}
+	if s == "" {
+		return "无输出"
+	}
+	return s
+}
 
 // Agent 用工具调用循环驱动大模型完成任务。
 type Agent struct {
@@ -36,6 +86,7 @@ type Agent struct {
 	readFiles       map[string]bool // 已完整读取的文件（去重）
 	listDirs        map[string]bool // 已 list_dir 的参数（去重）
 	grepPatterns    map[string]bool // 已 grep_search 的 pattern（去重）
+	workLog        []workEntry    // 工作记忆：每步操作的摘要
 	timeout         time.Duration // 单任务超时（0=不限）
 }
 
@@ -43,78 +94,12 @@ type Agent struct {
 // 可通过 SetTimeout 调整或通过 --timeout 参数配置。
 const TaskTimeout = 10 * time.Minute
 
-const skillRules = "" +
-	"## 运行环境\n" +
-	"- shell 类型和可用命令参见上方执行环境信息，严格按照检测到的 shell 写命令。\n" +
-	"- 长期服务用 background=true，绝对不用 start/nohup/&。\n" +
-	"- 你已在工作目录中，直接执行命令即可，不需要开头加 cd。\n" +
-	"\n" +
-	"## 文件操作（CRITICAL — 最高优先级）\n" +
-	"### 强制批量规则（read_file + list_dir 通用）\n" +
-	"1. **需要读取/列出 2 个及以上文件/目录时，必须使用 `paths` 参数一次完成**，不可逐个调用。\n" +
-	"   `paths` 是一个字符串数组，如 [\"a.go\", \"b.go\"]，最多 20 个。\n" +
-	"   read_file 和 list_dir 均支持 `path`（单个）+ `paths`（批量）。\n" +
-	"2. **大文件读取：超过 200 行的文件默认只显示头尾各 50 行摘要。**\n" +
-	"   如需查看中间部分，用 `start_line`（起始行号）+ `max_lines`（行数）参数指定行范围。\n" +
-	"   **不要**用 sed/head/tail 等命令读文件，Windows 不可用且浪费工具调用轮次。\n" +
-	"   示例：{\"path\": \"ui/app.go\", \"start_line\": 450, \"max_lines\": 130}\n" +
-	"3. 调研项目结构时，先 list_dir 看目录，再一次性用 read_file+paths 批量读取关键文件。\n" +
-	"   示例：{\"paths\": [\"main.go\", \"go.mod\", \"agent/agent.go\", \"config/config.go\"]}\n" +
-	"\n" +
-	"### 强制批量写入规则\n" +
-	"1. **严禁对多个文件依次调用 write_file 工具**。每次模型响应中，针对 write_file 或 batch_write 的调用，最多只能出现 1 次。\n" +
-	"2. 如果你的任务需要创建或修改 **2 个及以上**的文件，**必须**使用 batch_write 工具。\n" +
-	"   batch_write 的 `files` 参数是一个 JSON 对象(Map)，键为文件路径（相对根目录），值为文件完整内容，一次性提交所有文件。\n" +
-	"3. write_file **仅限**只需写 1 个文件时使用。任何多文件场景使用 write_file 都是违规。\n" +
-	"4. 在执行写入前，请先通过 read_file（必要时用 paths 批量读取）和 list_dir 完成所有调研，制定完整计划，然后**一次性执行** batch_write。\n" +
-	"   禁止「写 A → 读 A → 写 B」的循环操作模式。\n" +
-	"5. 写入前先用 list_dir / read_file 了解项目结构，不要臆测。\n" +
-	"6. **禁止猜测文件路径**。read_file / write_file 失败提示文件不存在时，立即用 list_dir 查看目录结构，不要换路径重试。\n" +
-	"   每次 read_file 失败都要先确认文件是否真实存在，否则会浪费大量工具调用轮次。\n" +
-	"\n" +
-	"### 多文件创建示例（必须遵循）\n" +
-	"**正确做法**——一次性 batch_write：\n" +
-	"用户请求：「创建一个 index.html, style.css, app.js」\n" +
-	"你的响应中必须有且仅有一个 batch_write 调用：\n" +
-	"```json\n" +
-	"{\"tool_calls\":[{\"name\":\"batch_write\",\"arguments\":{\"files\":{\"index.html\":\"<html>...</html>\",\"style.css\":\"body{...}\",\"app.js\":\"console.log('hi');\"}}}]}\n" +
-	"```\n" +
-	"**错误做法**——绝对禁止：分三次调用 write_file。（这会导致工具调用轮次耗尽，任务强制终止）\n" +
-	"\n" +
-	"## Python 执行\n" +
-	"- 运行 Python 代码直接用 execute_python，**禁止**先写 .py 文件再执行。不需要把代码保存到工作目录。\n" +
-	"- execute_python 自带沙箱隔离，会自动创建临时目录并在执行后清理。\n" +
-	"\n" +
-	"## 命令执行纪律\n" +
-	"1. 执行构建/运行命令前,先用 read_file 确认相关配置文件。\n" +
-	"2. **启动服务必须设 background=true**。绝对不用 start/nohup/&。\n" +
-	"3. **命令失败先诊断**:仔细读错误输出,定位根因;同一命令最多 2 种写法。\n" +
-	"4. **已确认在运行的服务不要 kill**。端口在监听→报告成功。\n" +
-	"5. 命令输出如实报告,不粉饰失败、不猜测原因。\n" +
-	"\n" +
-	"## 任务拆解\n" +
-	"1. 3 步以上的复杂任务,**第一个动作**必须是 write_plan 写出计划。\n" +
-	"2. 每完成一步,write_plan 更新状态。\n" +
-	"\n" +
-	"## 工具调用预算\n" +
-	"- 单次任务总工具调用次数限制为 40 次（含只读工具）。\n" +
-	"- 当剩余调用次数不足 3 次时，系统会拒绝多个 write_file 调用并要求你合并为 batch_write。\n" +
-	"- 合理规划：调研阶段用 2-3 次（list_dir + read_file），然后 1 次 batch_write 完成所有文件。\n" +
-	"- 验证阶段（编译、测试）额外需要 2-3 次，总计控制在 10 次以内，不要挥霍。\n" +
-	"\n" +
-	"## 验证与完成\n" +
-	"- **声称完成前**:read_file 确认改动、编译通过验证、所有 plan 步骤 done。\n" +
-	"- 先读后写:未读过的文件不要凭记忆猜测。\n" +
-	"- 审批被拒绝时解释原因、提供替代方案,不强行绕过。\n" +
-	"- 完成后用两句话总结做了什么，最后一行只写「执行完成」。注意：只说执行完成，不要再多说其他话。"
-
 // reflectPrompt 在连续工具调用失败时注入，要求模型暂停并分析根因。
-const reflectPrompt = "" +
-	"【反思提示】已连续多次工具调用返回错误。请暂停当前策略，逐条回答以下问题：\n" +
-	"1. 上述错误的根因是什么？（不要猜测，要基于错误信息分析）\n" +
-	"2. 当前策略是否方向错误？是否需要换一个完全不同的思路？\n" +
-	"3. 是否需要先用 list_dir 或 read_file 确认项目结构 / 文件内容？\n\n" +
-	"输出你的分析后，再给出下一轮的工具调用。"
+const reflectPrompt = "【暂停并反思】连续多次工具调用出错。请逐条分析：\n" +
+	"1. 根因是什么（基于错误信息，不是猜测）\n" +
+	"2. 是否需要换一个完全不同的策略\n" +
+	"3. 是否需要先确认项目结构/文件内容\n\n" +
+	"分析后给出下一轮的工具调用。"
 
 // New 创建 Agent。maxTurns 为单次请求内的最大工具调用轮数。
 func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTurns int, workspace string, fastModel, proModel string) *Agent {
@@ -132,7 +117,7 @@ func New(client *llm.Client, registry *tools.Registry, approver *Approver, maxTu
 		projectOverview = projInfo.Format()
 	}
 
-	base := egoBlock(workspace, constitution) + "\n" + skillRules + "\n- 所有面向用户的输出必须使用简体中文。"
+	base := egoBlock(workspace, constitution)
 
 	history := []llm.Message{{Role: "system", Content: base}}
 	if projectOverview != "" {
@@ -233,9 +218,10 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 	stageInjected := false
 	readOnlyCalls := 0 // 累计单独 read_file 调用次数（跨轮统计）
 	exploreTurns := 0   // 连续只读轮次（探索上限）
+	staleTurns  := 0   // 连续无产出轮次（无写文件/执行命令/更新计划）
 
 	startTime := time.Now()
-	maxExpand := a.maxTurns * 4 // 轮次自动扩展上限（初始的 4 倍）
+	maxExpand := a.maxTurns * 2 // 轮次自动扩展上限（初始的 2 倍）
 	for turn := 0; ; turn++ {
 		// 超时检查（跳过首轮——至少要启动一次）
 		if turn > 0 && a.timeout > 0 && time.Since(startTime) > a.timeout {
@@ -265,6 +251,11 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 
 		a.debugLog.LLMRequest(len(a.history[0].Content), len(a.history), len(defs))
 		a.injectStageContext(turn, callCount, &stageInjected)
+
+			// 注入工作记忆：让模型始终看到"做过什么、什么失败了、不要再试什么"
+			if blob := workLogBlob(a.workLog, turn, callCount); blob != "" {
+				a.history = append(a.history, llm.Message{Role: "system", Content: blob})
+			}
 
 		// 跨轮 read_file 合并警告：累计单独读取 >= 3 次 → 强制合并
 		if readOnlyCalls >= 3 {
@@ -440,6 +431,13 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			if isErr {
 				roundHadError = true
 			}
+			// 工作记忆：每步操作追加一条摘要
+			a.workLog = append(a.workLog, workEntry{
+				tool:   tc.Function.Name,
+				args:   compactArgs(tc.Function.Arguments),
+				result: workSummary(result),
+				isErr:  isErr,
+			})
 			a.debugLog.ToolResult(step, tc.Function.Name, result, isErr)
 			ch <- Event{
 				Type:       EventToolResult,
@@ -457,25 +455,54 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			})
 		}
 
-		// ── 探索上限：连续多轮只读（无写/执行）→ 强制收敛 ──
-		roundAllReadOnly := true
+		// ── 停滞检测：区分"探索新文件"和"重复无效读取" ──
+		allReadOnly := true
+		roundHasOutput := false   // 是否有实质性产出
+		roundHasNewRead := false  // 是否读了新文件（有价值的探索）
 		for _, tc := range msg.ToolCalls {
 			if !isReadOnlyTool(tc.Function.Name) {
-				roundAllReadOnly = false
-				break
+				allReadOnly = false
+			}
+			if isProductiveTool(tc.Function.Name) {
+				roundHasOutput = true
+			}
+			if tc.Function.Name == "read_file" {
+				paths, _ := parseReadArgs(tc.Function.Arguments)
+				for _, f := range paths {
+					if !a.readFiles[f] {
+						roundHasNewRead = true
+						break
+					}
+				}
 			}
 		}
-		if roundAllReadOnly {
+
+		// 探索上限：仅当"全是只读且未读新文件"才算无效探索
+		if allReadOnly && !roundHasNewRead {
 			exploreTurns++
-			if exploreTurns >= 5 {
-				a.history = append(a.history, llm.Message{
-					Role:    "system",
-					Content: "【探索上限】你已连续多轮只调用读取/搜索工具。基于已获得的信息，请立即输出结论，或执行有实际效果的操作（写文件/执行命令/调用计划工具）。不要再重复探索。",
-				})
-				exploreTurns = 0
-			}
 		} else {
 			exploreTurns = 0
+		}
+		if exploreTurns >= 3 {
+			a.history = append(a.history, llm.Message{
+				Role:    "system",
+				Content: "【探索上限】已连续 " + fmt.Sprint(exploreTurns) + " 轮读取已看过的文件，没有进展。请立即执行实际操作（写文件/执行命令），或总结并结束任务。",
+			})
+			exploreTurns = 0
+		}
+
+		// 停滞上限：连续 6 轮无产出且无新探索 → 强制收敛
+		if roundHasOutput || roundHasNewRead {
+			staleTurns = 0
+		} else {
+			staleTurns++
+		}
+		if staleTurns >= 6 {
+			a.history = append(a.history, llm.Message{
+				Role:    "system",
+				Content: "【强制收敛】已连续 " + fmt.Sprint(staleTurns) + " 轮没有任何进展。你必须立即：要么执行实际修改操作，要么用一句话总结当前进度后结束。",
+			})
+			staleTurns = 0
 		}
 
 		// ── 失败触发反思：连续 2 轮有工具错误 → 注入反思提示 ──

@@ -24,10 +24,10 @@ const (
 )
 
 const (
-	maxChatRoomRounds = 30  // 全局角色轮次上限（可自动扩展）
-	maxDevToolCalls   = 15  // Dev 子循环最大工具调用次数
-	maxQARetries      = 3   // QA→Dev 回退次数上限，超限强制验收
-	maxUPRetries      = 2   // UserProxy 回退次数上限，超限强制通过
+	maxChatRoomRounds = 15  // 全局角色轮次上限（可自动扩展）
+	maxDevToolCalls   = 8   // Dev 子循环最大工具调用次数
+	maxQARetries      = 2   // QA→Dev 回退次数上限，超限强制验收
+	maxUPRetries      = 1   // UserProxy 回退次数上限，超限强制通过
 )
 
 // ChatArtifacts 各角色产出物。
@@ -61,6 +61,7 @@ type ChatRoom struct {
 	readFiles    map[string]bool // 已完整读取的文件（去重）
 	listDirs     map[string]bool // 已 list_dir 的参数（去重）
 	grepPatterns map[string]bool // 已 grep_search 的 pattern（去重）
+	workLog     []workEntry     // 工作记忆：每步操作的摘要
 }
 
 // NewChatRoom 创建多角色协作 Agent。
@@ -177,12 +178,8 @@ func (cr *ChatRoom) RunAsync(input string) <-chan Event {
 // ── 主循环 ──
 
 func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
-	// 模型选择：已锁定则用锁定模型，否则用 pro（多角色任务通常是复杂任务）
-	if cr.modelLock != "" {
-		cr.client.SetModel(cr.modelLock)
-	} else {
-		cr.client.SetModel(cr.proModel)
-	}
+	// 多角色协作强制使用 pro 模型。flash 模型无法胜任多步推理/代码生成/测试验收。
+	cr.client.SetModel(cr.proModel)
 
 	cr.journal.Task(input + " [多角色协作]")
 	cr.debugLog.SetTask(input + " [多角色协作]")
@@ -190,7 +187,7 @@ func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
 
 	startTime := time.Now()
 	cr.sharedHistory = []llm.Message{
-		{Role: "system", Content: "当前是多角色协作模式。以下是各角色的工作记录："},
+		{Role: "system", Content: "当前是多角色协作模式。所有角色的输出、分析、总结必须使用简体中文。以下是各角色的工作记录："},
 	}
 
 	artifacts := ChatArtifacts{}
@@ -204,7 +201,7 @@ func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
 		RoleUserProxy: "用户代理：验收并决定是否通过",
 	}
 
-	maxExpand := maxChatRoomRounds * 3 // 轮次自动扩展上限（初始的 3 倍）
+	maxExpand := maxChatRoomRounds * 2 // 轮次自动扩展上限（初始的 2 倍）
 	roundLimit := maxChatRoomRounds
 	qaRetryCount := 0   // QA→Dev 回退次数
 	upRetryCount := 0   // UserProxy 回退次数
@@ -215,10 +212,10 @@ func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
 			return
 		}
 
-		// 接近上限时自动扩展
-		if round >= roundLimit-2 && roundLimit < maxExpand {
+		// 接近上限时自动扩展（更克制：剩 3 轮时才扩展）
+		if round >= roundLimit-3 && roundLimit < maxExpand {
 			roundLimit *= 2
-			cr.addToHistory(fmt.Sprintf("[系统] 轮次上限已自动扩展到 %d 轮，请继续推进任务。", roundLimit))
+			cr.addToHistory(fmt.Sprintf("[系统] 轮次上限已自动扩展到 %d 轮，请加速收敛，不要开启新的子任务。", roundLimit))
 		}
 
 		// 轮次紧张时强制收敛：UserProxy 必须给出最终结论
@@ -235,7 +232,7 @@ func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
 			role = next
 
 		case RoleDev:
-			summary, next := cr.runDevTurn(artifacts.Spec, ch)
+			summary, next := cr.runDevTurn(artifacts, ch)
 			artifacts.CodeSummary = summary
 			cr.addToHistory(fmt.Sprintf("[程序员]\n%s", summary))
 			role = next
@@ -269,10 +266,11 @@ func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
 			if nextRole == RoleDev || nextRole == RolePM {
 				upRetryCount++
 				if upRetryCount >= maxUPRetries {
-					// 回退超限：强制通过，记录未解决问题
-					cr.addToHistory(fmt.Sprintf("[系统] UserProxy 已回退 %d 次（上限 %d）。为避免无限循环，强制验收通过。未解决的问题已记录在测试报告中，可作为后续迭代任务。", upRetryCount, maxUPRetries))
-					ch <- Event{Type: EventDone, Message: "[用户代理 验收通过（有遗留问题）]\n" + decision, TokenCount: cr.totalTokens}
-					cr.journal.Note("✅ " + decision)
+					// 回退超限：调用 LLM 生成最终总结，而不是只丢一句"有遗留问题"
+					cr.addToHistory(fmt.Sprintf("[系统] UserProxy 已回退 %d 次（上限 %d），协作强制结束。请基于各角色的工作记录生成最终总结。", upRetryCount, maxUPRetries))
+					summary := cr.generateFinalSummary(ch)
+					ch <- Event{Type: EventDone, Message: summary, TokenCount: cr.totalTokens}
+					cr.journal.Note("⚠️ " + summary)
 					return
 				}
 			}
@@ -286,18 +284,37 @@ func (cr *ChatRoom) runLoop(input string, ch chan<- Event) {
 
 // ── 各角色执行方法 ──
 
-// finishWithSummary 多角色协作异常终止时，调用大模型基于各角色工作记录生成总结。
-func (cr *ChatRoom) finishWithSummary(reason string, ch chan<- Event) {
-	prompt := fmt.Sprintf("多角色协作未能完成（%s）。请基于各角色的工作记录，用简洁的中文总结：1. 各角色已完成的工作 2. 遇到的问题 3. 剩余未完成事项 4. 建议的下一步。不要提及轮次限制本身。", reason)
+// generateFinalSummary 强制验收通过时，调用 LLM 生成完整的交付总结。
+// 与 finishWithSummary 不同，这个不是"失败"场景，而是"接受当前状态"。
+func (cr *ChatRoom) generateFinalSummary(ch chan<- Event) string {
+	prompt := "协作达到回退上限，请基于以上各角色的工作记录，用简体中文生成一份最终交付总结。格式：\n" +
+		"### 已完成\n[逐条列出实际完成的功能和改动]\n" +
+		"### 存在的问题\n[逐条列出 QA 发现但未修复的问题，及严重程度]\n" +
+		"### 当前状态\n[一句话说明项目是否可运行、主要功能是否可用]\n" +
+		"### 建议的后续步骤\n[用户接下来应该做什么]"
 	history := append(append([]llm.Message{}, cr.sharedHistory...), llm.Message{Role: "user", Content: prompt})
 
 	msg, usage, err := cr.client.Chat(history, nil)
 	cr.totalTokens += usage.TotalTokens
 	if err != nil {
-		ch <- Event{Type: EventError, Message: fmt.Sprintf("多角色协作未完成（%s），且生成总结失败: %v", reason, err), TokenCount: cr.totalTokens}
+		return fmt.Sprintf("协作强制结束（%v）", err)
+	}
+	return "【协作完成 · 达到回退上限】\n" + msg.Content
+}
+
+// finishWithSummary 多角色协作异常终止时，调用大模型基于各角色工作记录生成总结。
+func (cr *ChatRoom) finishWithSummary(reason string, ch chan<- Event) {
+	prompt := fmt.Sprintf("多角色协作因 %s 而终止。请基于各角色的工作记录，用简体中文生成总结：\n"+
+		"### 已完成\n[逐条]\n### 未完成\n[逐条]\n### 建议\n[下一步做什么]", reason)
+	history := append(append([]llm.Message{}, cr.sharedHistory...), llm.Message{Role: "user", Content: prompt})
+
+	msg, usage, err := cr.client.Chat(history, nil)
+	cr.totalTokens += usage.TotalTokens
+	if err != nil {
+		ch <- Event{Type: EventError, Message: fmt.Sprintf("协作终止（%s），且生成总结失败: %v", reason, err), TokenCount: cr.totalTokens}
 		return
 	}
-	finalMsg := fmt.Sprintf("【任务未完成 · %s】\n%s", reason, msg.Content)
+	finalMsg := fmt.Sprintf("【协作终止 · %s】\n%s", reason, msg.Content)
 	ch <- Event{Type: EventDone, Message: finalMsg, TokenCount: cr.totalTokens}
 	cr.journal.Note("⚠️ " + reason + "：" + msg.Content)
 }
@@ -332,103 +349,132 @@ func (cr *ChatRoom) runPMTurn(originalInput, transition string, ch chan<- Event)
 }
 
 // runDevTurn 程序员：带工具的子循环，按 PM 规格实现代码。
-func (cr *ChatRoom) runDevTurn(spec string, ch chan<- Event) (string, Role) {
+// 如果是 QA 回退的修复轮次（artifacts.TestReport 非空），使用更严格的约束。
+func (cr *ChatRoom) runDevTurn(artifacts ChatArtifacts, ch chan<- Event) (string, Role) {
 	ch <- Event{Type: EventThinking, TokenCount: cr.totalTokens}
 
+	isRetry := artifacts.TestReport != ""
+
 	contextBlock := cr.buildContextBlock()
-	cr.debugLog.LLMRequest(len(devSystemPrompt), 0, len(cr.registry.Definitions()))
+	var userMsg string
+	if isRetry {
+		userMsg = fmt.Sprintf("%s\n\n## 产品经理规格\n%s\n\n## QA 发现的问题（只修这些，不要做其他改动）\n%s",
+			contextBlock, artifacts.Spec, artifacts.TestReport)
+	} else {
+		userMsg = fmt.Sprintf("%s\n\n## 产品经理规格\n%s", contextBlock, artifacts.Spec)
+	}
+
+	sysPrompt := devSystemPrompt
+	maxRounds := maxDevToolCalls
+	if isRetry {
+		sysPrompt = devFixPrompt
+		maxRounds = 4 // 修复模式：更少轮次
+	}
+
+	cr.debugLog.LLMRequest(len(sysPrompt), 0, len(cr.registry.Definitions()))
 	devHistory := []llm.Message{
-		{Role: "system", Content: devSystemPrompt},
-		{Role: "user", Content: fmt.Sprintf("%s\n\n## 产品经理规格\n%s", contextBlock, spec)},
+		{Role: "system", Content: sysPrompt},
+		{Role: "user", Content: userMsg},
 	}
 
 	allTools := cr.registry.Definitions()
 	step := 0
 	callCount := 0
-	readOnlyTurns := 0  // 连续只读轮次计数（防模型反复调研不写码）
-	readOnlyCalls := 0  // 累计单独 read_file 次数（跨轮）
+	readOnlyTurns := 0
 
-	for toolTurn := 0; toolTurn < maxDevToolCalls; toolTurn++ {
+	for toolTurn := 0; toolTurn < maxRounds; toolTurn++ {
 		ch <- Event{Type: EventThinking, TokenCount: cr.totalTokens}
+
+		// 注入工作记忆
+		if blob := workLogBlob(cr.workLog, toolTurn, callCount); blob != "" {
+			devHistory = append(devHistory, llm.Message{Role: "system", Content: blob})
+		}
 
 		msg, usage, err := cr.client.Chat(devHistory, allTools)
 		if err != nil {
 			return fmt.Sprintf("Dev 调用失败: %v", err), RoleQA
 		}
 		cr.totalTokens += usage.TotalTokens
-		var tcNames []string
-		for _, tc := range msg.ToolCalls {
-			tcNames = append(tcNames, tc.Function.Name)
-		}
-		cr.debugLog.LLMResponse(cr.client.Model(), len(msg.Content), tcNames, usage.PromptTokens, usage.CompletionTokens)
+		cr.debugLog.LLMResponse(cr.client.Model(), len(msg.Content), toolCallNames(msg.ToolCalls), usage.PromptTokens, usage.CompletionTokens)
 		devHistory = append(devHistory, msg)
 
-		// 输出模型思考/说明文字
 		if len(msg.ToolCalls) > 0 && strings.TrimSpace(msg.Content) != "" {
 			ch <- Event{Type: EventMessage, Message: strings.TrimSpace(msg.Content), TokenCount: cr.totalTokens}
 		}
 
 		if len(msg.ToolCalls) == 0 {
-			// 无工具调用 → Dev 完成
 			return msg.Content, RoleQA
 		}
 
-		// 只读滥用检测：连续多轮只读 → 强制写代码
+		// ── 收敛检测 ──
 		allReadOnly := true
+		roundHasNewRead := false
 		for _, tc := range msg.ToolCalls {
 			if !isReadOnlyTool(tc.Function.Name) {
 				allReadOnly = false
-				break
+			}
+			if tc.Function.Name == "read_file" && cr.hasNewReadTarget(tc.Function.Arguments) {
+				roundHasNewRead = true
 			}
 		}
-		if allReadOnly {
+
+		// 只读轮次追踪（仅对重复读取计数）
+		if allReadOnly && !roundHasNewRead {
 			readOnlyTurns++
-			if readOnlyTurns >= 4 {
-				return fmt.Sprintf("程序员调研过度（连续 %d 轮只调用读取工具，未写代码），实现可能不完整。", readOnlyTurns), RoleQA
-			}
-			if readOnlyTurns >= 2 {
-				devHistory = append(devHistory, llm.Message{
-					Role: "system",
-					Content: fmt.Sprintf("【警告】你已连续 %d 轮只调用读取工具（read_file/list_dir/grep_search）。规格已经足够清晰，请立即用 write_file / batch_write 写代码。不要再重复调研，不要再读取无关文件。", readOnlyTurns),
-				})
-			}
 		} else {
 			readOnlyTurns = 0
 		}
 
-		// 同轮 read_file 合并检查 + 跨轮单独读取计数
+		// ── 渐进引导：催促写代码但不禁止必要的读取 ──
+		if !isRetry {
+			// 首次开发：渐进式引导写代码，允许继续读关键文件
+			if toolTurn == 2 {
+				devHistory = append(devHistory, llm.Message{
+					Role: "system",
+					Content: "【进度提醒】已探索 3 轮。如果你已理解项目结构，请开始写代码。如果还需要读文件，限制在 1-2 个最关键的文件，读完后立即写代码。",
+				})
+			} else if toolTurn == 4 {
+				devHistory = append(devHistory, llm.Message{
+					Role: "system",
+					Content: "【开始写代码】已进行 5 轮。现在应该已经充分了解了项目。请用 batch_write 一次性完成所有需要的修改。如果确实还需要读文件，最多再读 1 个。",
+				})
+			}
+		} else {
+			// 修复模式：QA 已指明问题，快速修复
+			if toolTurn == 1 {
+				devHistory = append(devHistory, llm.Message{
+					Role: "system",
+					Content: "【修复模式】QA 已指明具体问题。请最多再读 1 个文件确认位置，然后在下一轮用 batch_write 修复所有问题。",
+				})
+			}
+		}
+
+		// 重复阅读提醒（已读文件再读 = 浪费）
+		if readOnlyTurns >= 3 {
+			devHistory = append(devHistory, llm.Message{
+				Role: "system",
+				Content: fmt.Sprintf("【注意】已连续 %d 轮读取已看过的文件。请基于已知信息开始写代码。", readOnlyTurns),
+			})
+			readOnlyTurns = 0
+		}
+
+		// 同轮 read_file 合并检查
 		readCount, hasBatchRead := 0, false
 		for _, tc := range msg.ToolCalls {
-			if tc.Function.Name != "read_file" {
-				continue
-			}
-			readCount++
-			var rargs struct {
-				Paths []string `json:"paths"`
-			}
-			if json.Unmarshal([]byte(tc.Function.Arguments), &rargs) == nil && len(rargs.Paths) > 0 {
-				hasBatchRead = true
-			} else {
-				readOnlyCalls++
+			if tc.Function.Name == "read_file" {
+				readCount++
+				var rargs struct{ Paths []string `json:"paths"` }
+				if json.Unmarshal([]byte(tc.Function.Arguments), &rargs) == nil && len(rargs.Paths) > 0 {
+					hasBatchRead = true
+				}
 			}
 		}
 		if readCount >= 2 && !hasBatchRead {
-			warning := "检测到你尝试在同一轮调用 " + fmt.Sprint(readCount) + " 次 read_file。请立即合并为一次调用，使用 paths 参数（如 {\"paths\": [\"a.go\", \"b.go\"]}）。"
+			warning := "请合并为一次 read_file，使用 paths 参数。"
 			for _, tc := range msg.ToolCalls {
-				devHistory = append(devHistory, llm.Message{
-					Role:       "tool",
-					ToolCallID: tc.ID,
-					Content:    warning,
-				})
+				devHistory = append(devHistory, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: warning})
 			}
 			continue
-		}
-		if readOnlyCalls >= 3 {
-			devHistory = append(devHistory, llm.Message{
-				Role:    "system",
-				Content: fmt.Sprintf("【警告】你已累计 %d 次单独 read_file。后续读取必须用 paths 批量合并（最多 20 个文件），否则将被拒绝。", readOnlyCalls),
-			})
-			readOnlyCalls = 0
 		}
 
 		for _, tc := range msg.ToolCalls {
@@ -436,33 +482,27 @@ func (cr *ChatRoom) runDevTurn(spec string, ch chan<- Event) (string, Role) {
 			step++
 
 			toolArgs := compactArgs(tc.Function.Arguments)
-			ch <- Event{
-				Type:       EventToolCall,
-				ToolName:   tc.Function.Name,
-				ToolArgs:   toolArgs,
-				Step:       step,
-				CallCount:  callCount,
-				TokenCount: cr.totalTokens,
-			}
+			ch <- Event{Type: EventToolCall, ToolName: tc.Function.Name, ToolArgs: toolArgs, Step: step, CallCount: callCount, TokenCount: cr.totalTokens}
 
 			result := cr.executeDevTool(0, tc, ch)
-			ch <- Event{
-				Type:       EventToolResult,
-				ToolName:   tc.Function.Name,
-				ToolResult: result,
-				Step:       step,
-				TokenCount: cr.totalTokens,
-			}
+			isErr := strings.HasPrefix(result, "执行出错：")
+			cr.workLog = append(cr.workLog, workEntry{tool: tc.Function.Name, args: compactArgs(tc.Function.Arguments), result: workSummary(result), isErr: isErr})
+			ch <- Event{Type: EventToolResult, ToolName: tc.Function.Name, ToolResult: result, Step: step, TokenCount: cr.totalTokens}
 
-			devHistory = append(devHistory, llm.Message{
-				Role:       "tool",
-				ToolCallID: tc.ID,
-				Content:    result,
-			})
+			devHistory = append(devHistory, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: result})
 		}
 	}
 
 	return "程序员达到工具调用上限，实现可能不完整。", RoleQA
+}
+
+// toolCallNames 提取工具调用名称列表（用于 debug log）。
+func toolCallNames(tcs []llm.ToolCall) []string {
+	names := make([]string, len(tcs))
+	for i, tc := range tcs {
+		names[i] = tc.Function.Name
+	}
+	return names
 }
 
 // runQATurn 测试：轻量工具调用循环，可读文件+执行命令+搜索。
@@ -509,7 +549,7 @@ func (cr *ChatRoom) runUserProxyTurn(originalInput string, artifacts ChatArtifac
 
 // ── 辅助方法 ──
 
-// runRoleWithTools 轻量工具调用循环，用于 PM/QA/UserProxy 等非 Dev 角色。
+// runRoleWithTools 轻量工具调用循环，用于 QA/UserProxy 等非 Dev 角色。
 // 最多 maxIter 轮工具调用，每次工具调用都会发送事件并通过审批门。
 func (cr *ChatRoom) runRoleWithTools(systemPrompt, userContent string, allowedTools []string, maxIter int, ch chan<- Event) string {
 	history := []llm.Message{
@@ -518,8 +558,23 @@ func (cr *ChatRoom) runRoleWithTools(systemPrompt, userContent string, allowedTo
 	}
 	tools := cr.filterTools(allowedTools)
 	var lastContent string
+	readOnlyTurns := 0 // 连续只读轮次计数
 
 	for i := 0; i < maxIter; i++ {
+		// 连续 2 轮只读 → 注入收敛提示
+		if readOnlyTurns >= 2 {
+			history = append(history, llm.Message{
+				Role:    "system",
+				Content: "【收敛提示】你已连续多轮只读取/查看。基于已有信息，请立即输出结论，不要继续探索。",
+			})
+			readOnlyTurns = 0
+		}
+
+		// 注入工作记忆
+		if blob := workLogBlob(cr.workLog, i, i+1); blob != "" {
+			history = append(history, llm.Message{Role: "system", Content: blob})
+		}
+
 		msg, usage, err := cr.client.Chat(history, tools)
 		if err != nil {
 			return fmt.Sprintf("调用失败: %v", err)
@@ -540,8 +595,22 @@ func (cr *ChatRoom) runRoleWithTools(systemPrompt, userContent string, allowedTo
 		if len(msg.ToolCalls) == 0 {
 			return msg.Content
 		}
-		// 保存最后的内容（如果工具调用后没有额外内容）
+		// 保存最后的内容
 		lastContent = msg.Content
+
+		// 只读轮次追踪
+		allReadOnly := true
+		for _, tc := range msg.ToolCalls {
+			if !isReadOnlyTool(tc.Function.Name) {
+				allReadOnly = false
+				break
+			}
+		}
+		if allReadOnly {
+			readOnlyTurns++
+		} else {
+			readOnlyTurns = 0
+		}
 
 		// 同轮 read_file 合并检查：2+ 个单独 read_file 且无 paths → 拒绝并提示
 		readCount, hasBatchRead := 0, false
@@ -579,6 +648,13 @@ func (cr *ChatRoom) runRoleWithTools(systemPrompt, userContent string, allowedTo
 			}
 
 			result := cr.executeDevTool(0, tc, ch)
+			isErr := strings.HasPrefix(result, "执行出错：")
+			cr.workLog = append(cr.workLog, workEntry{
+				tool:   tc.Function.Name,
+				args:   compactArgs(tc.Function.Arguments),
+				result: workSummary(result),
+				isErr:  isErr,
+			})
 			ch <- Event{
 				Type:       EventToolResult,
 				ToolName:   tc.Function.Name,
@@ -608,6 +684,45 @@ func isReadOnlyTool(name string) bool {
 		return true
 	}
 	return false
+}
+
+// isProductiveTool 判断工具是否有实质性产出（修改文件/执行命令/更新计划）。
+// 用于停滞检测：连续多轮无产出 → 强制收敛。
+func isProductiveTool(name string) bool {
+	switch name {
+	case "write_file", "batch_write", "execute_shell", "execute_python",
+		"write_plan", "verify", "restore":
+		return true
+	}
+	return false
+}
+
+// hasNewReadTarget 检查 read_file 参数中是否包含尚未完整读取的文件。
+// 用于区分"探索新文件"（有意义的）和"重复读旧文件"（浪费轮次）。
+func (cr *ChatRoom) hasNewReadTarget(argsRaw string) bool {
+	var r struct {
+		Path      string   `json:"path"`
+		Paths     []string `json:"paths"`
+		StartLine int      `json:"start_line"`
+	}
+	if json.Unmarshal([]byte(argsRaw), &r) != nil {
+		return true // 解析失败，给 benefit of doubt
+	}
+	paths := r.Paths
+	if len(paths) == 0 && r.Path != "" {
+		paths = []string{r.Path}
+	}
+	isFullRead := r.StartLine <= 1
+	for _, f := range paths {
+		if !cr.readFiles[f] {
+			return true // 至少有一个文件没完整读过 → 新探索
+		}
+		// 已完整读过但这次是分段读（start_line > 1）→ 也视为新探索
+		if cr.readFiles[f] && !isFullRead {
+			return true
+		}
+	}
+	return false // 全部都是已完整读过的文件 → 重复
 }
 
 // executeDevTool 在 Dev 子循环中执行单个工具调用（含审批流程）。
@@ -760,132 +875,61 @@ func (cr *ChatRoom) addToHistory(content string) {
 
 // ── 角色 System Prompt ──
 
-const pmSystemPrompt = `你是一个资深产品经理。你需要将用户的模糊需求转化为清晰、可执行的技术规格。
+const pmSystemPrompt = `你是资深产品经理。将用户需求转化为清晰、可执行的技术规格。
 
-## 工作流程
-1. 分析用户原始需求，识别核心目标和约束
-2. 如果需求有歧义，先提出假设并标注
-3. 输出技术规格文档
-
-## 输出格式
-### 功能概述
-[一段话描述要实现什么]
-
-### 技术方案
-- 文件结构：列出需要创建/修改的文件
-- 技术选型：语言、框架、库（如适用）
-
-### 接口/数据定义
-- 输入参数
-- 输出格式
-- 关键数据结构
-
-### 边界条件
-- 正常流程
-- 异常处理
-- 性能约束（如适用）
-
-### 验收标准
-1. [具体可验证的标准]
-2. ...
-3. ...
-
-完成后末尾标注 [NEXT:dev]
-
-注意：
-- 不要写代码实现，不要写具体的函数体
-- 不要调用任何工具，不要自己探索代码——基于上方项目概况和用户需求输出规格
-- 规格要具体，程序员拿到可以直接开始编码
-- 如果对现有代码结构不确定，在规格中标注"需程序员确认"，由程序员实现时核实
-- 整个规格文档必须使用简体中文`
-
-const devSystemPrompt = `你是一个高级程序员。请根据产品经理的规格实现代码。
-
-## 工作规则
-- 使用 write_file / batch_write 创建或修改文件
-- 多文件操作必须用 batch_write 一次性完成
-- 实现后用 execute_shell 编译/运行验证
-- 遵循项目现有代码风格和目录结构
-- 不要修改规格之外的内容
-- 不确定的地方先 read_file 确认，不要猜测
-- 【批量读取纪律】需要读取多个文件时用 read_file 的 paths 参数一次完成（如 {"paths": ["a.go", "b.go"]}），严禁逐个调用
-- 调研项目结构先 list_dir，再批量读取关键文件
-- 【调研限制】调研阶段最多 2-3 次工具调用（1 次 list_dir + 1-2 次批量 read_file），之后必须立即开始写代码。禁止反复读取文件而不产出任何代码。
+## 核心纪律
+1. **一次到位**：直接基于项目概况和用户需求输出规格，不要发散。不需要调用工具探索代码。
+2. **聚焦核心**：只设计用户明确要求的功能，不追加"锦上添花"的扩展。
+3. **可执行**：规格要具体到程序员可以直接开始编码的程度。
 
 ## 输出格式
-实现完成后，用一段文字总结：
-- 创建/修改了哪些文件
-- 关键实现决策
-- 编译/运行验证结果
+### 功能概述 + 技术方案（文件结构、选型）
+### 接口/数据定义（关键的数据结构和接口）
+### 边界条件 + 验收标准（逐条可验证）
 
-末尾标注 [NEXT:qa]
+末尾标注 [NEXT:dev]。全部输出（分析、规格、说明）必须使用简体中文。如对代码不确定，标注「需程序员确认」。`
 
-注意：
-- 你可以使用任何可用工具（读、写、执行命令）
-- 每次工具调用都需审批，合理规划减少调用次数
-- 如果实现过程中发现规格问题，标注在总结中
-- 总结和所有面向用户的输出必须使用简体中文`
+const devSystemPrompt = `你是高级程序员。请根据产品经理的规格实现代码。
 
-const qaSystemPrompt = `你是一个测试工程师。请对照产品经理的规格和程序员的实现进行测试。
+## 核心纪律
+1. **快速交付**：调研 1-2 轮 → 写代码 1 轮 → 验证 1-2 轮，总计控制在 5 轮以内。
+2. **做完即停**：编译通过就输出 [NEXT:qa]，不要追加修改。
+3. **调研适度**：最多 list_dir 1 次 + 批量 read_file 1 次，然后必须开始写代码。禁止反复读取。
+4. **批量操作**：多文件读取用 paths 数组，多文件写入用 batch_write，严禁逐个操作。
 
-## 工作规则
-- 使用 execute_shell 运行测试命令
-- 使用 read_file 检查代码质量
-- 逐条对照验收标准，标记通过/失败
-- 发现问题要具体描述：哪条验收标准未满足、错误现象是什么
+## 输出
+总结创建/修改的文件、关键决策、验证结果，末尾标注 [NEXT:qa]。全部输出必须使用简体中文。`
 
-## 输出格式
-### 测试结果
-- ✅ 通过项：[列出]
-- ❌ 失败项：[列出具体问题和复现步骤]
+const devFixPrompt = `你是高级程序员。QA 已发现问题，你需要修复代码。不要重新探索项目——你已经了解代码结构。
 
-### 总体评估
-[一句话总结]
+## 核心纪律
+1. **只修 QA 列出的问题**：不要改其他文件，不要优化无关代码。
+2. **1 轮内开始写代码**：最多 1 次 read_file 确认问题位置，然后立即 batch_write 修复。
+3. **修复后编译验证**：用 execute_shell 确认编译通过。
+4. **批量操作**：多个文件用 batch_write 一次性修复。
 
-按以下规则标注末尾：
-- 如果全部通过 → 末尾标注 [NEXT:user_proxy]
-- 如果发现 bug → 末尾标注 [NEXT:dev] 并附详细 bug 描述
+## 输出
+列出修复的文件和验证结果，末尾标注 [NEXT:qa]。全部输出必须使用简体中文。`
 
-注意：
-- 你可以使用 execute_shell / read_file / grep_search / list_dir
-- 不要修改任何代码
-- 测试要具体，不要说"看起来没问题"
-- 【批量读取纪律】需要检查多个文件时用 read_file 的 paths 参数一次完成（如 {"paths": ["a.go", "b.go"]}），严禁逐个调用
-- 测试报告必须使用简体中文`
+const qaSystemPrompt = `你是测试工程师。对照规格和实现进行测试验证。
 
-const userProxySystemPrompt = `你是用户代理，代表提需求的最终用户进行验收。
+## 核心纪律
+1. **快速验证**：1-2 轮内完成测试并输出结论，不要反复读取。
+2. **直接判断**：全部通过 → [NEXT:user_proxy]；有 bug → [NEXT:dev] + 具体 bug 描述。
+3. **批量读取**：需检查多个文件时用 read_file paths 一次完成。
 
-## 审查项目
-请综合审查以下内容：
-1. 用户原始需求
-2. 产品经理的技术规格
-3. 程序员的代码实现
-4. 测试工程师的测试报告
+## 输出
+✅ 通过项 / ❌ 失败项 + 总体评估。末尾标注 [NEXT:user_proxy] 或 [NEXT:dev]。全部输出必须使用简体中文。`
 
-## 验收标准
-- 实现是否完整覆盖原始需求？
-- 测试是否充分？
-- 是否有遗漏的功能？
-- 代码质量是否可接受？
+const userProxySystemPrompt = `你是用户代理，代表用户验收最终交付。
 
-## 输出格式
-### 验收结论
-[一段话总结]
+## 核心纪律
+1. **快速决策**：1-2 轮内必须给出最终结论。不要反复读取文件。
+2. **务实验收**：基本满足需求 → [DONE]；需要小修 → [NEXT:dev] + 具体说明；需求偏差 → [NEXT:pm]。
+3. **批量读取**：需检查多个文件时用 read_file paths 一次完成。
 
-### 问题（如有）
-[逐条列出]
-
-按以下规则标注末尾：
-- 完全满意，验收通过 → [DONE]
-- 需要程序员小修（改几行代码）→ [NEXT:dev] 并说明要改什么
-- 需求理解有偏差，需要产品经理重新澄清 → [NEXT:pm] 并说明哪里不对
-
-注意：
-- 你可以使用 read_file / list_dir 查看代码
-- 从用户角度出发，不纠结于实现细节
-- 如果原始需求简单但规格过度设计，指出过度工程化问题
-- 【批量读取纪律】需要检查多个文件时用 read_file 的 paths 参数一次完成（如 {"paths": ["a.go", "b.go"]}），严禁逐个调用
-- 验收结论必须使用简体中文`
+## 输出
+验收结论 + 问题列表（如有）。末尾标注 [DONE]、[NEXT:dev] 或 [NEXT:pm]。全部输出必须使用简体中文。`
 
 // ── 任务复杂度判定 ──
 

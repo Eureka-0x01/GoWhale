@@ -14,12 +14,13 @@ type ProjectInfo struct {
 	ModuleName  string
 	GoVersion   string
 	DirectDeps  []string
-	SubModules  []string
 	FileCounts  map[string]int
 	EntryPoints []string
+	FileTree    string // 完整文件树（目录+文件名，不含内容）
+	KeyFiles    string // 关键文件摘要（main.go 头部、go.mod 依赖等）
 }
 
-// Scan 扫描工作目录，生成项目信息摘要。
+// Scan 扫描工作目录，生成项目信息摘要（含完整文件树，避免模型逐个探索）。
 func Scan(workspace string) (*ProjectInfo, error) {
 	info := &ProjectInfo{
 		FileCounts: map[string]int{},
@@ -37,7 +38,14 @@ func Scan(workspace string) (*ProjectInfo, error) {
 		info.Language = detectLanguage(workspace)
 	}
 
-	// 扫描文件
+	// 读取关键文件摘要
+	info.KeyFiles = readKeyFiles(workspace)
+
+	// 构建文件树
+	var treeBuf strings.Builder
+	var fileTreeEntries []string // 收集所有条目再排序
+	treeBuf.WriteString("项目文件树:\n")
+
 	filepath.Walk(workspace, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return nil
@@ -50,22 +58,13 @@ func Scan(workspace string) (*ProjectInfo, error) {
 			base := filepath.Base(path)
 			switch {
 			case strings.HasPrefix(base, "."), base == "node_modules", base == "vendor",
-				base == "__pycache__", base == "test_output", base == ".aicode":
+				base == "__pycache__", base == "test_output", base == ".aicode",
+				base == "Python", base == "third_party", base == "docs":
 				return filepath.SkipDir
-			}
-			// 记录顶级子模块
-			parts := strings.SplitN(rel, string(filepath.Separator), 2)
-			if len(parts) == 1 {
-				sf, _ := os.ReadDir(path)
-				for _, s := range sf {
-					if strings.HasSuffix(s.Name(), ".go") {
-						info.SubModules = append(info.SubModules, parts[0]+"/")
-						break
-					}
-				}
 			}
 			return nil
 		}
+		// 跳过非代码文件
 		ext := strings.ToLower(filepath.Ext(fi.Name()))
 		if ext == "" {
 			ext = "(无后缀)"
@@ -75,10 +74,57 @@ func Scan(workspace string) (*ProjectInfo, error) {
 		if base == "main.go" || base == "index.js" || base == "index.ts" || base == "main.rs" {
 			info.EntryPoints = append(info.EntryPoints, rel)
 		}
+
+		// 收集文件条目（带行数和目录层次）
+		dir := filepath.Dir(rel)
+		if dir == "." {
+			dir = ""
+		}
+		fileTreeEntries = append(fileTreeEntries, fmt.Sprintf("%s/%s", dir, fi.Name()))
 		return nil
 	})
 
+	// 按目录分组排序，生成缩进文件树
+	sort.Strings(fileTreeEntries)
+	lastDir := ""
+	for _, entry := range fileTreeEntries {
+		dir, file := filepath.Split(entry)
+		dir = strings.TrimRight(dir, "/\\")
+		if dir != lastDir {
+			treeBuf.WriteString(fmt.Sprintf("  %s/\n", dir))
+			lastDir = dir
+		}
+		treeBuf.WriteString(fmt.Sprintf("    %s\n", file))
+	}
+	info.FileTree = treeBuf.String()
+
 	return info, nil
+}
+
+// readKeyFiles 读取关键文件头部摘要，让模型无需逐个探索。
+func readKeyFiles(workspace string) string {
+	var sb strings.Builder
+
+	// main.go 头部（前 30 行）
+	if data, err := os.ReadFile(filepath.Join(workspace, "main.go")); err == nil {
+		lines := strings.Split(string(data), "\n")
+		sb.WriteString("main.go 头部:\n")
+		n := len(lines)
+		if n > 30 {
+			n = 30
+		}
+		sb.WriteString(strings.Join(lines[:n], "\n"))
+		sb.WriteString("\n\n")
+	}
+
+	// go.mod 全文（很小但关键）
+	if data, err := os.ReadFile(filepath.Join(workspace, "go.mod")); err == nil {
+		sb.WriteString("go.mod:\n")
+		sb.WriteString(string(data))
+		sb.WriteString("\n\n")
+	}
+
+	return sb.String()
 }
 
 // Format 生成注入 LLM system prompt 的文本块。
@@ -96,20 +142,15 @@ func (info *ProjectInfo) Format() string {
 	if len(info.EntryPoints) > 0 {
 		sb.WriteString(fmt.Sprintf("入口: %s\n", strings.Join(info.EntryPoints, ", ")))
 	}
-	if len(info.SubModules) > 0 {
-		sb.WriteString(fmt.Sprintf("子模块: %s\n", strings.Join(info.SubModules, " ")))
-	}
 	if len(info.DirectDeps) > 0 {
-		sb.WriteString(fmt.Sprintf("直接依赖 (%d): %s\n", len(info.DirectDeps),
+		sb.WriteString(fmt.Sprintf("直接依赖: %s\n",
 			strings.Join(trimDeps(info.DirectDeps, 8), ", ")))
 	}
-	var extStats []string
-	for ext, count := range info.FileCounts {
-		extStats = append(extStats, fmt.Sprintf("%s=%d", ext, count))
+	sb.WriteString("\n" + info.FileTree + "\n")
+	if info.KeyFiles != "" {
+		sb.WriteString("\n" + info.KeyFiles)
 	}
-	sort.Strings(extStats)
-	sb.WriteString(fmt.Sprintf("文件: %s\n", strings.Join(extStats, ", ")))
-	sb.WriteString("</project_overview>")
+	sb.WriteString("</project_overview>\n")
 	return sb.String()
 }
 
