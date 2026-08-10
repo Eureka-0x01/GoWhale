@@ -356,7 +356,24 @@ func (m *Model) stop() {
 func (m *Model) setupGlobalKeys() {
 	m.app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if m.pendingApproval != nil {
-			// 审批弹窗显示时，只拦截 Ctrl+C，其他按键放行给 Modal
+			// y=允许 a=始终允许 n=拒绝  Ctrl+C=退出
+			switch event.Rune() {
+			case 'y', 'Y':
+				m.pendingApproval.Callback <- agent.ApprovalReply{Allowed: true}
+				m.pendingApproval = nil
+				m.pages.RemovePage("approval")
+				return nil
+			case 'a', 'A':
+				m.pendingApproval.Callback <- agent.ApprovalReply{Allowed: true, Permanent: true}
+				m.pendingApproval = nil
+				m.pages.RemovePage("approval")
+				return nil
+			case 'n', 'N':
+				m.pendingApproval.Callback <- agent.ApprovalReply{Allowed: false}
+				m.pendingApproval = nil
+				m.pages.RemovePage("approval")
+				return nil
+			}
 			if event.Key() == tcell.KeyCtrlC {
 				m.stop()
 				return nil
@@ -602,8 +619,8 @@ func (m *Model) showApprovalModal(ev agent.Event) {
 	text := fmt.Sprintf("🔧 %s  %s%s\n\n是否允许执行？",
 		ev.ToolName, ev.ApprovalRequest.Arguments, warningText)
 
-	modal := tview.NewModal().
-		SetText(text).
+	modal := tview.NewModal()
+	modal.SetText(text).
 		AddButtons([]string{"允许 (y)", "始终允许 (a)", "拒绝 (n)"}).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			reply := agent.ApprovalReply{}
@@ -623,6 +640,7 @@ func (m *Model) showApprovalModal(ev agent.Event) {
 		})
 
 	m.pages.AddPage("approval", modal, true, true)
+	m.app.SetFocus(modal) // 焦点给弹窗——Tab 切换按钮，Enter 选择
 }
 
 // ── 命令处理 ──
@@ -895,7 +913,8 @@ func (m *Model) refreshStatusBar() {
 	model := m.agent.ModelName()
 	tokens := m.agent.TokenCount()
 	m.statusBar.Clear()
-	left := fmt.Sprintf(" GoWhale v0.3  %s  │  %s token", model, formatTokens(tokens))
+	ctx := agent.ContextBudget(m.agent.Messages())
+	left := fmt.Sprintf(" GoWhale v0.3  %s  │  %s token  │  ctx: %s", model, formatTokens(tokens), ctx)
 	if lock := m.agent.ModelLock(); lock != "" {
 		left += "  │  🔒 " + lock
 	}

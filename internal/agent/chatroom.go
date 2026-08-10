@@ -331,21 +331,10 @@ func (cr *ChatRoom) runPMTurn(originalInput, transition string, ch chan<- Event)
 		taskLine += fmt.Sprintf("\n\n## 用户代理反馈（需重新澄清）\n%s", transition)
 	}
 
-	// 单次 LLM 调用直接输出规格（无工具）
-	history := []llm.Message{
-		{Role: "system", Content: pmSystemPrompt},
-		{Role: "user", Content: fmt.Sprintf("%s\n\n%s", contextBlock, taskLine)},
-	}
-	msg, usage, err := cr.client.Chat(history, nil)
-	cr.totalTokens += usage.TotalTokens
-	if err != nil {
-		return fmt.Sprintf("PM 调用失败: %v", err), RoleDev
-	}
-	// 输出 PM 的思考/说明
-	if strings.TrimSpace(msg.Content) != "" {
-		ch <- Event{Type: EventMessage, Message: strings.TrimSpace(msg.Content), TokenCount: cr.totalTokens}
-	}
-	return msg.Content, RoleDev
+	// PM 用 project_overview + read_file 了解项目，写精准方案（最多 5 次工具调用）
+	userMsg := fmt.Sprintf("%s\n\n%s", contextBlock, taskLine)
+	return cr.runRoleWithTools(pmSystemPrompt, userMsg,
+		[]string{"project_overview", "project_file", "read_file"}, 5, ch), RoleDev
 }
 
 // runDevTurn 程序员：带工具的子循环，按 PM 规格实现代码。
@@ -378,19 +367,34 @@ func (cr *ChatRoom) runDevTurn(artifacts ChatArtifacts, ch chan<- Event) (string
 	}
 
 	allTools := cr.registry.Definitions()
+	writeOnlyTools := cr.filterTools([]string{"write_file", "batch_write", "edit_file", "execute_shell"})
 	step := 0
 	callCount := 0
 	readOnlyTurns := 0
+	forceWrite := false
 
+	hasWritten := false
 	for toolTurn := 0; toolTurn < maxRounds; toolTurn++ {
+		// 读太多不写 → 强制关掉只读工具，只留写工具
+		if !forceWrite && !hasWritten && callCount >= 5 {
+			forceWrite = true
+			devHistory = append(devHistory, llm.Message{
+				Role:    "system",
+				Content: "【强制写入模式】已读够多了。只读工具已关闭，现在只能调用 write_file/batch_write/edit_file/execute_shell。立即修改代码。",
+			})
+		}
+		currentTools := allTools
+		if forceWrite {
+			currentTools = writeOnlyTools
+		}
 		ch <- Event{Type: EventThinking, TokenCount: cr.totalTokens}
 
 		// 注入工作记忆
-		if blob := workLogBlob(cr.workLog, toolTurn, callCount); blob != "" {
+		if blob := workLogBlob(cr.workLog, toolTurn, callCount, estMsgSize(devHistory)); blob != "" {
 			devHistory = append(devHistory, llm.Message{Role: "system", Content: blob})
 		}
 
-		msg, usage, err := cr.client.Chat(devHistory, allTools)
+		msg, usage, err := cr.client.Chat(devHistory, currentTools)
 		if err != nil {
 			return fmt.Sprintf("Dev 调用失败: %v", err), RoleQA
 		}
@@ -403,6 +407,13 @@ func (cr *ChatRoom) runDevTurn(artifacts ChatArtifacts, ch chan<- Event) (string
 		}
 
 		if len(msg.ToolCalls) == 0 {
+			if !hasWritten && toolTurn < maxRounds-1 {
+				devHistory = append(devHistory, llm.Message{
+					Role:    "system",
+					Content: "【必须写代码】还没有修改任何文件。调用 edit_file 或 batch_write 修改代码。不写代码 = 没完成。",
+				})
+				continue
+			}
 			return msg.Content, RoleQA
 		}
 
@@ -487,6 +498,9 @@ func (cr *ChatRoom) runDevTurn(artifacts ChatArtifacts, ch chan<- Event) (string
 			result := cr.executeDevTool(0, tc, ch)
 			isErr := strings.HasPrefix(result, "执行出错：")
 			cr.workLog = append(cr.workLog, workEntry{tool: tc.Function.Name, args: compactArgs(tc.Function.Arguments), result: workSummary(result), isErr: isErr})
+			if tc.Function.Name == "write_file" || tc.Function.Name == "batch_write" || tc.Function.Name == "edit_file" {
+				hasWritten = true
+			}
 			ch <- Event{Type: EventToolResult, ToolName: tc.Function.Name, ToolResult: result, Step: step, TokenCount: cr.totalTokens}
 
 			devHistory = append(devHistory, llm.Message{Role: "tool", ToolCallID: tc.ID, Content: result})
@@ -515,7 +529,7 @@ func (cr *ChatRoom) runQATurn(artifacts ChatArtifacts, ch chan<- Event) (string,
 		contextBlock, artifacts.Spec, artifacts.CodeSummary)
 
 	content := cr.runRoleWithTools(qaSystemPrompt, context,
-		[]string{"read_file", "list_dir", "execute_shell", "grep_search"},
+		[]string{"read_file", "project_overview", "execute_shell", "grep_search"},
 		5, ch)
 
 	if strings.Contains(content, "[NEXT:dev]") {
@@ -571,7 +585,7 @@ func (cr *ChatRoom) runRoleWithTools(systemPrompt, userContent string, allowedTo
 		}
 
 		// 注入工作记忆
-		if blob := workLogBlob(cr.workLog, i, i+1); blob != "" {
+		if blob := workLogBlob(cr.workLog, i, i+1, estMsgSize(history)); blob != "" {
 			history = append(history, llm.Message{Role: "system", Content: blob})
 		}
 
@@ -704,6 +718,7 @@ func (cr *ChatRoom) hasNewReadTarget(argsRaw string) bool {
 		Path      string   `json:"path"`
 		Paths     []string `json:"paths"`
 		StartLine int      `json:"start_line"`
+		MaxLines  int      `json:"max_lines"`
 	}
 	if json.Unmarshal([]byte(argsRaw), &r) != nil {
 		return true // 解析失败，给 benefit of doubt
@@ -712,7 +727,7 @@ func (cr *ChatRoom) hasNewReadTarget(argsRaw string) bool {
 	if len(paths) == 0 && r.Path != "" {
 		paths = []string{r.Path}
 	}
-	isFullRead := r.StartLine <= 1
+	isFullRead := r.StartLine <= 1 && r.MaxLines == 0
 	for _, f := range paths {
 		if !cr.readFiles[f] {
 			return true // 至少有一个文件没完整读过 → 新探索
@@ -733,13 +748,14 @@ func (cr *ChatRoom) executeDevTool(step int, tc llm.ToolCall, ch chan<- Event) s
 			Path      string   `json:"path"`
 			Paths     []string `json:"paths"`
 			StartLine int      `json:"start_line"`
+		MaxLines  int      `json:"max_lines"`
 		}
 		if json.Unmarshal([]byte(tc.Function.Arguments), &r) == nil {
 			paths := r.Paths
 			if len(paths) == 0 && r.Path != "" {
 				paths = []string{r.Path}
 			}
-			isFullRead := r.StartLine <= 1
+			isFullRead := r.StartLine <= 1 && r.MaxLines == 0
 			if len(paths) > 0 {
 				var dup []string
 				for _, f := range paths {
@@ -894,8 +910,8 @@ const devSystemPrompt = `你是高级程序员。请根据产品经理的规格�
 ## 核心纪律
 1. **快速交付**：调研 1-2 轮 → 写代码 1 轮 → 验证 1-2 轮，总计控制在 5 轮以内。
 2. **做完即停**：编译通过就输出 [NEXT:qa]，不要追加修改。
-3. **调研适度**：最多 list_dir 1 次 + 批量 read_file 1 次，然后必须开始写代码。禁止反复读取。
-4. **批量操作**：多文件读取用 paths 数组，多文件写入用 batch_write，严禁逐个操作。
+3. **不要重复探索**：PM 已用 project_overview 分析过项目。直接读 PM 指定文件，用 edit_file 改代码。上下文 ~16KB，大文件用 start_line+max_lines 分段。
+4. **搜索用 grep_search 工具**：不要用 execute_shell + findstr/grep 搜索代码。grep_search 跨平台可用。
 
 ## 输出
 总结创建/修改的文件、关键决策、验证结果，末尾标注 [NEXT:qa]。全部输出必须使用简体中文。`

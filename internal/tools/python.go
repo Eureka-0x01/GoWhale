@@ -57,6 +57,9 @@ class SafetyChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _check_module(self, name, lineno):
+        # os.path 允许导入（路径拼接等纯操作是安全的）
+        if name == 'os.path' or name.startswith('os.path.'):
+            return
         mod = name.split('.')[0]
         blocked = {'os', 'subprocess', 'socket', 'urllib', 'urllib2', 'urllib3',
                    'http', 'ftplib', 'smtplib', 'telnetlib', 'requests',
@@ -204,7 +207,7 @@ func checkPythonAST(code string) error {
 
 	if err != nil {
 		if strings.Contains(result, "VIOLATION:") {
-			return fmt.Errorf("AST 安全检查未通过: %s\n请用安全模块改写", strings.TrimPrefix(result, "VIOLATION:"))
+			return fmt.Errorf("AST 安全检查未通过: %s\nPython 沙箱不能读写文件——用 read_file/grep_search/edit_file 工具代替。纯计算/数据处理可以用 Python。", strings.TrimPrefix(result, "VIOLATION:"))
 		}
 		// AST 检查脚本自身出错(可能语法错误)
 		if strings.Contains(result, "SyntaxError") {

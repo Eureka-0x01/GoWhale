@@ -120,9 +120,9 @@ func (ShellTool) Execute(args json.RawMessage) (string, error) {
 	}
 	if runErr != nil {
 		if result == "" {
-			return "", fmt.Errorf("命令执行失败: %w。→ 不要重试此命令。请检查命令拼写、依赖是否安装、路径是否正确，然后换一种不同的方式", runErr)
+			return "", fmt.Errorf("命令执行失败: %w。→ 检查命令拼写和路径。如果是 Windows，确认用的是 cmd 命令（dir/type/findstr 而非 ls/cat/grep）", runErr)
 		}
-		return fmt.Sprintf("命令返回非零退出码（%v）。输出：\n%s\n→ 不要重试此命令。请根据上面的错误输出，换一种完全不同的方式解决问题", runErr, result), nil
+		return fmt.Sprintf("命令退出码 %v。输出：\n%s\n→ findstr 退出码 1 = 未找到匹配（正常，不是错误）。其他命令请根据输出判断是否需要重试。", runErr, result), nil
 	}
 	if result == "" {
 		result = "(命令执行成功，无输出)"

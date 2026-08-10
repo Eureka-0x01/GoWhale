@@ -76,11 +76,15 @@ func main() {
 		tools.RestoreTool{},
 		tools.ListDirTool{},
 		tools.GrepTool{},
+		tools.EditFileTool{},
+		tools.ProjectOverviewTool{},
+		tools.ProjectFileTool{},
 	)
 
 	approver := agent.NewApprover()
 	workspace, _ := os.Getwd()
 	tools.SetWorkspace(workspace)
+	tools.WorkspaceProvider = func() string { return workspace }
 	projSettings := config.LoadProjectSettings(workspace)
 
 	// ── 有参数 ──

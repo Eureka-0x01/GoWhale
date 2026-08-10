@@ -26,12 +26,18 @@ type workEntry struct {
 }
 
 // workLogBlob 将工作记录渲染成注入上下文的文本块。
-func workLogBlob(entries []workEntry, turn, callCount int) string {
+// ctxBytes > 0 时显示上下文用量百分比。
+func workLogBlob(entries []workEntry, turn, callCount, ctxBytes int) string {
 	if len(entries) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("【工作记录 · 第%d轮 · 已用%d次工具调用】\n", turn, callCount))
+	budget := ""
+	if ctxBytes > 0 {
+		pct := ctxBytes * 100 / 16000
+		budget = fmt.Sprintf(" · ~%dKB(%d%%)", ctxBytes/1024, pct)
+	}
+	b.WriteString(fmt.Sprintf("【工作记录 · 第%d轮 · %d次调用%s】\n", turn, callCount, budget))
 	for i, e := range entries {
 		mark := "✓"
 		if e.isErr {
@@ -179,6 +185,21 @@ func (a *Agent) ModelName() string { return a.client.Model() }
 // GetApprover 返回审批器实例（供 TUI 注入决策）。
 func (a *Agent) GetApprover() *Approver { return a.approver }
 
+// filterToolDefs 按名称过滤工具定义，返回精简的工具列表。
+func (a *Agent) filterToolDefs(names []string) []llm.Tool {
+	allow := make(map[string]bool, len(names))
+	for _, n := range names {
+		allow[n] = true
+	}
+	var filtered []llm.Tool
+	for _, t := range a.registry.Definitions() {
+		if allow[t.Function.Name] {
+			filtered = append(filtered, t)
+		}
+	}
+	return filtered
+}
+
 // ── RunAsync：事件驱动执行 ──
 
 // RunAsync 在独立 goroutine 中执行任务，通过 channel 发送事件。
@@ -211,11 +232,14 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 	a.debugLog.SetTask(input)
 	a.history = append(a.history, llm.Message{Role: "user", Content: input})
 	defs := a.registry.Definitions()
+	writeOnlyDefs := a.filterToolDefs([]string{"write_file", "batch_write", "edit_file", "execute_shell", "verify", "restore"})
 	step := 0
 	callCount := 0
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 2
 	stageInjected := false
+	hasWritten := false
+	forceWrite := false
 	readOnlyCalls := 0 // 累计单独 read_file 调用次数（跨轮统计）
 	exploreTurns := 0   // 连续只读轮次（探索上限）
 	staleTurns  := 0   // 连续无产出轮次（无写文件/执行命令/更新计划）
@@ -253,7 +277,7 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 		a.injectStageContext(turn, callCount, &stageInjected)
 
 			// 注入工作记忆：让模型始终看到"做过什么、什么失败了、不要再试什么"
-			if blob := workLogBlob(a.workLog, turn, callCount); blob != "" {
+			if blob := workLogBlob(a.workLog, turn, callCount, estimateCtxSize(a.history)); blob != "" {
 				a.history = append(a.history, llm.Message{Role: "system", Content: blob})
 			}
 
@@ -266,15 +290,25 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			readOnlyCalls = 0
 		}
 
-		// 上下文过大时自动压缩（消息 > 30 条 或 token > 8000）
-		if a.totalTokens <= 0 {
-			a.totalTokens = estimateTokens(a.history)
-		}
-		if len(a.history) > 30 || a.totalTokens > 8000 {
+		// DeepSeek 有 128K 上下文，只在真正需要时压缩
+		curTokens := estimateTokens(a.history)
+		if len(a.history) > 80 || curTokens > 50000 {
 			a.Compact()
 		}
 
-		msg, usage, err := a.client.Chat(a.history, defs)
+		// 读太多不写 → 强制切换到只写工具
+	if !forceWrite && !hasWritten && callCount >= 5 {
+		forceWrite = true
+		a.history = append(a.history, llm.Message{
+			Role:    "system",
+			Content: "【强制写入模式】已读够多。只读工具已关闭，只能调用 write_file/batch_write/edit_file/execute_shell。立即修改代码。",
+		})
+	}
+	currentDefs := defs
+	if forceWrite {
+		currentDefs = writeOnlyDefs
+	}
+	msg, usage, err := a.client.Chat(a.history, currentDefs)
 		if err != nil {
 			a.debugLog.Error(fmt.Sprintf("调用失败: %v", err))
 			ch <- Event{Type: EventError, Message: fmt.Sprintf("调用失败: %v", err), TokenCount: a.totalTokens}
@@ -432,6 +466,10 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 				roundHadError = true
 			}
 			// 工作记忆：每步操作追加一条摘要
+			// 追踪是否已写入
+			if tc.Function.Name == "write_file" || tc.Function.Name == "batch_write" || tc.Function.Name == "edit_file" {
+				hasWritten = true
+			}
 			a.workLog = append(a.workLog, workEntry{
 				tool:   tc.Function.Name,
 				args:   compactArgs(tc.Function.Arguments),
@@ -451,7 +489,7 @@ func (a *Agent) runLoop(input string, ch chan<- Event) {
 			a.history = append(a.history, llm.Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
-				Content:    result,
+				Content:    truncateResult(tc.Function.Name, result),
 			})
 		}
 
@@ -531,6 +569,7 @@ func (a *Agent) dedupReadFile(argsRaw string) string {
 		Path      string   `json:"path"`
 		Paths     []string `json:"paths"`
 		StartLine int      `json:"start_line"`
+		MaxLines  int      `json:"max_lines"`
 	}
 	if json.Unmarshal([]byte(argsRaw), &r) != nil {
 		return ""
@@ -542,16 +581,19 @@ func (a *Agent) dedupReadFile(argsRaw string) string {
 	if len(paths) == 0 {
 		return ""
 	}
-	isFullRead := r.StartLine <= 1 // 无 start_line 或从开头读 → 视为完整读取
+	// 只有明确请求完整内容（max_lines=0）且无 start_line 才标记为"已完整读取"。
+	// 默认截断模式（头尾各50行）和大文件分段读取（start_line>1）都不标记——
+	// 因为模型看到的不是完整内容，需要时应该能继续分段读。
+	isFullRead := r.StartLine <= 1 && r.MaxLines == 0
 
 	var dup []string
 	for _, f := range paths {
 		if a.readFiles[f] {
-			dup = append(dup, f) // 已完整读取 → 重复
+			dup = append(dup, f)
 		} else if isFullRead {
-			a.readFiles[f] = true // 首次完整读取 → 记录
+			a.readFiles[f] = true
 		}
-		// 未完整读取过的分段读取（start_line > 1）→ 允许
+		// 分段读取或截断模式 → 不标记，允许后续读取
 	}
 	if len(dup) > 0 {
 		return fmt.Sprintf("（去重）以下文件已完整读取，内容在上文上下文中，请直接使用，不要重复或分段读取：%s", strings.Join(dup, ", "))
@@ -791,10 +833,7 @@ func (a *Agent) Compact() bool {
 	if len(a.history) <= compactKeep {
 		return false
 	}
-	if a.totalTokens <= 0 {
-		a.totalTokens = estimateTokens(a.history)
-	}
-	beforeTokens := a.totalTokens
+	beforeTokens := estimateTokens(a.history)
 
 	n := len(a.history)
 	sysCount := 0
@@ -820,10 +859,9 @@ func (a *Agent) Compact() bool {
 	}
 
 	summary := fmt.Sprintf(
-		"【上下文已压缩】之前的对话已截断（约 %s token，%d 条消息 → %d 条）。"+
-			"如果当前任务依赖之前的上下文，请先回顾下方保留的最近消息；"+
-			"如有必要让用户重新描述需求。",
-		llm.FormatTokens(beforeTokens), n, n-cutIdx+sysCount,
+		"【上下文已压缩】早期对话已截断（约 %s token → %d 条）。"+
+			"之前读过的文件内容可能已丢失，需要时请重新 read_file 读取。",
+		llm.FormatTokens(beforeTokens), n-cutIdx+sysCount,
 	)
 
 	newHistory := make([]llm.Message, 0, sysCount+1+(n-cutIdx))
@@ -834,6 +872,10 @@ func (a *Agent) Compact() bool {
 
 	a.totalTokens = estimateTokens(newHistory)
 	a.recentCmds = map[string]int{}
+	// 清除去重缓存——文件内容已从上下文移除，允许重新读取
+	a.readFiles = map[string]bool{}
+	a.listDirs = map[string]bool{}
+	a.grepPatterns = map[string]bool{}
 	return true
 }
 
