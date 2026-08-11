@@ -1,137 +1,36 @@
+// Package config 加载配置。
+// 优先级：环境变量 > .env 文件 > ~/.gowhale/.env 文件 > 默认值。
 package config
 
 import (
-	"bufio"
-	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
+// Config 应用配置。
+// 可通过 AICODE_API_KEY / AICODE_BASE_URL / AICODE_MODEL 环境变量覆盖，
+// 或在 ~/.gowhale/.env / 当前目录 .env 中设置。
 type Config struct {
-	BaseURL     string
-	APIKey      string
-	Model       string
-	ProModel    string
-	OllamaURL   string
-	OllamaModel string
-	Provider    string // 上次使用的提供商: deepseek / ollama
-	MaxTurns    int
+	APIKey  string // API Key，默认 sk-placeholder
+	BaseURL string // API 地址，默认 https://api.deepseek.com/v1
+	Model   string // 模型名，默认 deepseek-v4-flash
 }
 
 func Load() Config {
-	homeDir, _ := os.UserHomeDir()
-	globalEnv := filepath.Join(homeDir, ".gowhale", ".env")
-
-	loadDotEnv(globalEnv)
+	// 加载 .env 文件（不覆盖已有环境变量）
+	home, _ := os.UserHomeDir()
+	loadDotEnv(filepath.Join(home, ".gowhale", ".env"))
 	loadDotEnv(".env")
 
-	cfg := Config{
-		BaseURL:     getenv("AICODE_BASE_URL", "https://api.deepseek.com/v1"),
-		APIKey:      getenv("AICODE_API_KEY", ""),
-		Model:       getenv("AICODE_MODEL", "deepseek-v4-flash"),
-		ProModel:    getenv("AICODE_PRO_MODEL", "deepseek-v4-pro"),
-		OllamaURL:   getenv("AICODE_OLLAMA_URL", ""),
-		OllamaModel: getenv("AICODE_OLLAMA_MODEL", ""),
-		Provider:    getenv("AICODE_PROVIDER", "deepseek"),
-		MaxTurns:    getenvInt("AICODE_MAX_TURNS", 40),
+	return Config{
+		APIKey:  getenv("AICODE_API_KEY", "sk-placeholder"),
+		BaseURL: getenv("AICODE_BASE_URL", "https://api.deepseek.com/v1"),
+		Model:   getenv("AICODE_MODEL", "deepseek-v4-flash"),
 	}
-
-	// 自动恢复上次使用的提供商
-	if cfg.Provider == "ollama" && cfg.OllamaURL != "" && cfg.OllamaModel != "" {
-		cfg.BaseURL = cfg.OllamaURL
-		cfg.APIKey = "ollama"
-		cfg.Model = cfg.OllamaModel
-		cfg.ProModel = cfg.OllamaModel
-	}
-
-	if cfg.APIKey == "" {
-		cfg.APIKey = promptKey(globalEnv)
-	}
-
-	return cfg
 }
 
-// PromptOllama 首次使用 Ollama 时交互式询问，保存到 ~/.gowhale/.env。
-func PromptOllama(in *bufio.Reader) (url, model string) {
-	homeDir, _ := os.UserHomeDir()
-	savePath := filepath.Join(homeDir, ".gowhale", ".env")
-
-	fmt.Print("\n首次使用 Ollama，需要配置：\n")
-	fmt.Print("  Ollama 地址 [默认 http://localhost:11434/v1]: ")
-	input, _ := in.ReadString('\n')
-	url = strings.TrimSpace(input)
-	if url == "" {
-		url = "http://localhost:11434/v1"
-	}
-
-	fmt.Print("  模型名（如 qwen3-coder:30b，用 ollama list 查看）: ")
-	input, _ = in.ReadString('\n')
-	model = strings.TrimSpace(input)
-	if model == "" {
-		fmt.Println("  ✗ 模型名不能为空")
-		return "", ""
-	}
-
-	// 保存到 ~/.gowhale/.env
-	dir := filepath.Dir(savePath)
-	os.MkdirAll(dir, 0o700)
-
-	// 读取已有配置
-	existing, _ := os.ReadFile(savePath)
-	content := string(existing)
-	if !strings.Contains(content, "AICODE_OLLAMA_URL") {
-		content += fmt.Sprintf("\n# Ollama 本地模型\nAICODE_OLLAMA_URL=%s\nAICODE_OLLAMA_MODEL=%s\n", url, model)
-		os.WriteFile(savePath, []byte(content), 0o600)
-		fmt.Printf("  ✓ 已保存到 %s\n", savePath)
-	}
-
-	os.Setenv("AICODE_OLLAMA_URL", url)
-	os.Setenv("AICODE_OLLAMA_MODEL", model)
-	return
-}
-
-// SaveProvider 保存当前使用的提供商到 ~/.gowhale/.env。
-func SaveProvider(provider string) {
-	homeDir, _ := os.UserHomeDir()
-	savePath := filepath.Join(homeDir, ".gowhale", ".env")
-
-	existing, _ := os.ReadFile(savePath)
-	content := string(existing)
-
-	// 移除旧的 AICODE_PROVIDER 行
-	lines := strings.Split(content, "\n")
-	var newLines []string
-	for _, line := range lines {
-		if !strings.HasPrefix(strings.TrimSpace(line), "AICODE_PROVIDER") {
-			newLines = append(newLines, line)
-		}
-	}
-	content = strings.Join(newLines, "\n")
-
-	// 追加新的
-	content = strings.TrimRight(content, "\n") + fmt.Sprintf("\nAICODE_PROVIDER=%s\n", provider)
-	os.WriteFile(savePath, []byte(content), 0o600)
-	os.Setenv("AICODE_PROVIDER", provider)
-}
-
-func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func getenvInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return def
-}
-
+// loadDotEnv 读取 key=value 格式的 .env 文件，写入 os.Setenv（不覆盖已有值）。
 func loadDotEnv(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -148,37 +47,16 @@ func loadDotEnv(path string) {
 		}
 		key := strings.TrimSpace(kv[0])
 		val := strings.TrimSpace(kv[1])
-		val = strings.Trim(val, "\"'")
+		val = strings.Trim(val, `"'`)
 		if key != "" && os.Getenv(key) == "" {
 			os.Setenv(key, val)
 		}
 	}
 }
 
-func promptKey(savePath string) string {
-	fmt.Fprintln(os.Stderr, "未检测到 API Key。")
-	fmt.Fprint(os.Stderr, "请输入 DeepSeek API Key（如 sk-xxx）：")
-
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "读取失败，请设置环境变量 AICODE_API_KEY 后重试。")
-		os.Exit(1)
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	key := strings.TrimSpace(input)
-	if key == "" {
-		fmt.Fprintln(os.Stderr, "Key 不能为空，请设置环境变量 AICODE_API_KEY 后重试。")
-		os.Exit(1)
-	}
-
-	dir := filepath.Dir(savePath)
-	if err := os.MkdirAll(dir, 0o700); err == nil {
-		content := fmt.Sprintf("# GoWhale 配置文件\nAICODE_API_KEY=%s\n", key)
-		if err := os.WriteFile(savePath, []byte(content), 0o600); err == nil {
-			fmt.Fprintf(os.Stderr, "✓ 已保存到 %s，下次无需重复输入。\n", savePath)
-		}
-	}
-
-	os.Setenv("AICODE_API_KEY", key)
-	return key
+	return def
 }

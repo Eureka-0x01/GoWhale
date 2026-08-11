@@ -1,22 +1,6 @@
 # 编译产物
 gowhale*.exe
 
-# 工作区运行时数据（每个项目目录下自动生成）
-.aicode/
-
 # 配置文件（含 API Key，不可提交）
 .env
 
-# AI 规则文件（自动生成，不提交）
-.deepseek/instructions.md
-
-# Go
-.gocache/
-.go-cache/
-
-# 构建脚本
-rebuild.bat
-
-# 测试
-test_output/
-trim.txt
