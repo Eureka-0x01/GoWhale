@@ -5,141 +5,152 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/awesome-gocui/gocui"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
+
+	"gowhale/internal/memory"
 )
 
-// ChatUI gocui 聊天界面。
+// ChatUI tview 聊天界面。
 type ChatUI struct {
-	g      *gocui.Gui
+	app    *tview.Application
+	view   *tview.TextView
 	runner runner.Runner
+	memory *memory.Store
 	ctx    context.Context
 	userID string
 	sessID string
+	model  string
 }
 
 // New 创建聊天界面。
-func New(g *gocui.Gui, r runner.Runner) *ChatUI {
+func New(r runner.Runner, mem *memory.Store, modelName string) *ChatUI {
 	return &ChatUI{
-		g:      g,
+		app:    tview.NewApplication(),
+		view:   tview.NewTextView(),
 		runner: r,
+		memory: mem,
 		ctx:    context.Background(),
 		userID: "user-1",
 		sessID: "session-1",
+		model:  modelName,
 	}
 }
 
 // Run 启动主循环。
 func (c *ChatUI) Run() error {
-	c.g.SetManagerFunc(c.layout)
-	c.g.SetKeybinding("", gocui.KeyCtrlC, gocui.ModNone, func(g *gocui.Gui, v *gocui.View) error {
-		return gocui.ErrQuit
-	})
-	return c.g.MainLoop()
-}
+	c.view.
+		SetDynamicColors(true).
+		SetScrollable(true).
+		SetWrap(true).
+		SetBorder(true).
+		SetTitle(" 对话 ")
 
-func (c *ChatUI) layout(g *gocui.Gui) error {
-	maxX, maxY := g.Size()
+	input := tview.NewInputField()
+	input.SetLabel("> ")
+	input.SetFieldWidth(0)
+	input.SetBorder(true)
+	input.SetTitle(" 输入（Enter 发送，Ctrl+C 退出）")
 
-	msgView, err := g.SetView("messages", 0, 0, maxX-1, maxY-4, 0)
-	if err != nil && err != gocui.ErrUnknownView {
-		return err
-	}
-	msgView.Title = " 对话 "
-	msgView.Autoscroll = true
-	msgView.Wrap = true
-	msgView.Editable = false
-
-	inputView, err := g.SetView("input", 0, maxY-3, maxX-1, maxY-1, 0)
-	if err != nil && err != gocui.ErrUnknownView {
-		return err
-	}
-	inputView.Title = " 输入（Enter 发送，Ctrl+C 退出）"
-	inputView.Editable = true
-	inputView.Wrap = true
-
-	if _, err := g.SetCurrentView("input"); err != nil {
-		return err
-	}
-
-	g.SetKeybinding("input", gocui.KeyEnter, gocui.ModNone, func(g *gocui.Gui, v *gocui.View) error {
-		text := strings.TrimSpace(v.Buffer())
-		if text == "" {
-			return nil
+	input.SetDoneFunc(func(key tcell.Key) {
+		if key != tcell.KeyEnter {
+			return
 		}
+		text := strings.TrimSpace(input.GetText())
+		if text == "" {
+			return
+		}
+		input.SetText("")
 		go c.send(text)
-		v.Clear()
-		v.SetCursor(0, 0)
-		return nil
 	})
 
+	// 状态栏
+	status := tview.NewTextView().
+		SetDynamicColors(true).
+		SetText(fmt.Sprintf("[white:blue] GoWhale [%s]  Ctrl+C 退出 ", c.model))
+
+	layout := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(status, 1, 0, false).
+		AddItem(c.view, 0, 1, false).
+		AddItem(input, 3, 0, true)
+
+	c.app.SetRoot(layout, true).SetFocus(input)
+
+	c.printHistory()
+
+	if err := c.app.Run(); err != nil {
+		return err
+	}
 	return nil
 }
 
+// printHistory 显示记忆中的最近对话。
+func (c *ChatUI) printHistory() {
+	if memText := c.memory.Format(); memText != "" {
+		fmt.Fprintf(c.view, "%s\n", memText)
+	}
+}
+
 func (c *ChatUI) send(text string) {
-	c.appendMsg("messages", fmt.Sprintf("\n[你] %s\n", text))
+	c.memory.Add("user", text)
+	c.write(fmt.Sprintf("\n[yellow::b][你] %s[white]\n", text))
 
 	msg := model.NewUserMessage(text)
 	events, err := c.runner.Run(c.ctx, c.userID, c.sessID, msg)
 	if err != nil {
-		c.appendMsg("messages", fmt.Sprintf("[错误] %v", err))
+		c.write(fmt.Sprintf("\n[red][错误] %v[white]\n", err))
 		return
 	}
 
-	var response strings.Builder
+	var answer strings.Builder
 	for ev := range events {
 		if ev.Error != nil {
-			c.appendMsg("messages", fmt.Sprintf("[错误] %s", ev.Error.Message))
+			c.write(fmt.Sprintf("\n[red][错误] %s[white]\n", ev.Error.Message))
 			break
 		}
 		if ev.Response == nil {
 			continue
 		}
 
-		// 工具调用
 		for _, choice := range ev.Response.Choices {
+			// 思考内容
+			if choice.Delta.ReasoningContent != "" {
+				c.write("[#888888]" + choice.Delta.ReasoningContent + "[white]")
+			}
+			if choice.Message.ReasoningContent != "" {
+				c.write("[#888888]" + choice.Message.ReasoningContent + "[white]")
+			}
+			// 工具调用
 			for _, tc := range choice.Message.ToolCalls {
-				c.appendMsg("messages", fmt.Sprintf("🔧 %s %s", tc.Function.Name, truncate(string(tc.Function.Arguments), 120)))
+				c.write(fmt.Sprintf("\n[cyan]🔧 %s %s[white]\n", tc.Function.Name, string(tc.Function.Arguments)))
 			}
 			// 工具结果
 			if ev.Response.Object == model.ObjectTypeToolResponse {
-				content := choice.Message.Content
-				c.appendMsg("messages", fmt.Sprintf("  → %s", truncate(content, 200)))
+				c.write(fmt.Sprintf("[#888888]  → %s[white]\n", choice.Message.Content))
 			}
-			// 流式文本
+			// 文本
 			if choice.Delta.Content != "" {
-				response.WriteString(choice.Delta.Content)
+				answer.WriteString(choice.Delta.Content)
 			}
-			// 完整消息
 			if choice.Message.Content != "" && choice.Message.Role == model.RoleAssistant {
-				response.WriteString(choice.Message.Content)
+				answer.WriteString(choice.Message.Content)
 			}
 		}
 	}
 
-	// 输出最终回复
-	if final := strings.TrimSpace(response.String()); final != "" {
-		c.appendMsg("messages", fmt.Sprintf("[AI] %s\n", final))
+	if final := strings.TrimSpace(answer.String()); final != "" {
+		c.memory.Add("assistant", final)
+		c.write(fmt.Sprintf("\n[green][AI] %s[white]\n", final))
 	}
 }
 
-func (c *ChatUI) appendMsg(viewName, text string) {
-	c.g.Update(func(g *gocui.Gui) error {
-		v, err := g.View(viewName)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(v, text)
-		return nil
+func (c *ChatUI) write(text string) {
+	c.app.QueueUpdateDraw(func() {
+		fmt.Fprint(c.view, text)
+		c.view.ScrollToEnd()
 	})
-}
-
-func truncate(s string, max int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > max {
-		return s[:max] + "..."
-	}
-	return s
 }

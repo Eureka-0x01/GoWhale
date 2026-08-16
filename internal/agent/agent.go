@@ -9,6 +9,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"gowhale/internal/config"
+	"gowhale/internal/memory"
 	"gowhale/internal/tools"
 )
 
@@ -77,8 +78,15 @@ const explorerInstruction = `## 角色
 
 // ── Runner 工厂 ──
 
-// NewRunner 创建主 Runner，包含主 Agent 和探索子 Agent。
-func NewRunner(cfg config.Config, workspace string) runner.Runner {
+// NewRunner 创建主 Runner + 记忆存储。
+func NewRunner(cfg config.Config, workspace string) (runner.Runner, *memory.Store) {
+	mem := memory.Load(workspace)
+	instruction := constitution + "\n\n" + devInstruction +
+		"\n\n当需要探索项目时，将任务委派给 explorer 子代理。"
+	if memText := mem.Format(); memText != "" {
+		instruction += "\n\n" + memText
+	}
+
 	llm := openai.New(cfg.Model,
 		openai.WithAPIKey(cfg.APIKey),
 		openai.WithBaseURL(cfg.BaseURL),
@@ -89,8 +97,7 @@ func NewRunner(cfg config.Config, workspace string) runner.Runner {
 	// 探索子代理（只读工具）
 	var explorerTools []tool.Tool
 	for _, t := range allTools {
-		name := t.Declaration().Name
-		if name == "read_file" || name == "list_dir" || name == "grep_search" {
+		if t.Declaration().Name == "read_file" || t.Declaration().Name == "list_dir" || t.Declaration().Name == "grep_search" {
 			explorerTools = append(explorerTools, t)
 		}
 	}
@@ -100,15 +107,14 @@ func NewRunner(cfg config.Config, workspace string) runner.Runner {
 		llmagent.WithTools(explorerTools),
 	)
 
-	// 主开发代理（全部工具）
 	dev := llmagent.New("dev",
 		llmagent.WithModel(llm),
-		llmagent.WithInstruction(constitution+"\n\n"+devInstruction+"\n\n当需要探索项目时，将任务委派给 explorer 子代理。"),
+		llmagent.WithInstruction(instruction),
 		llmagent.WithTools(allTools),
 		llmagent.WithSubAgents([]tagent.Agent{explorer}),
 	)
 
 	return runner.NewRunner("gowhale", dev,
 		runner.WithSessionService(inmemory.NewSessionService()),
-	)
+	), mem
 }
